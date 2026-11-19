@@ -26,27 +26,56 @@ export interface InterpretedIntentResult {
   modelVersion: string;
 }
 
-const CLINICAL_KEYWORDS = [
+const CLINICAL_ADVICE_KEYWORDS = [
   'diagnose',
   'diagnosis',
   'prescribe',
   'prescription',
   'dosage',
-  'medicine',
-  'tablet',
   'symptom',
   'chest pain',
   'blood pressure',
   'lab result',
-  'බෙහෙත්',
+  'should i take',
+  'should i give',
+  'what medicine should',
+  'what drug should',
   'රෝග විනිශ්චය',
   'මාත්‍රාව',
   'ලෙඩේ',
+  'බෙහෙත් නියම',
+  'මොන බෙහෙත් ද දෙන්න',
+];
+
+const INVENTORY_READ_TERMS = [
+  'stock',
+  'how many',
+  'expire',
+  'expiry',
+  'expiring',
+  'available',
+  'inventory',
+  'batch',
+  'price',
+  'cost',
+  'කීයක්',
+  'තියෙනවද',
+  'තොග',
+  'කල් ඉකුත්',
+  'මිල',
 ];
 
 export function isClinicalBoundaryRequest(text: string): boolean {
   const lower = text.toLowerCase();
-  return CLINICAL_KEYWORDS.some((kw) => lower.includes(kw));
+  if (CLINICAL_ADVICE_KEYWORDS.some((kw) => lower.includes(kw))) {
+    return true;
+  }
+  const mentionsDrugForm =
+    lower.includes('medicine') || lower.includes('tablet') || lower.includes('බෙහෙත්');
+  if (mentionsDrugForm && !INVENTORY_READ_TERMS.some((t) => lower.includes(t))) {
+    return true;
+  }
+  return false;
 }
 
 function getGeminiClient(): GoogleGenAI | null {

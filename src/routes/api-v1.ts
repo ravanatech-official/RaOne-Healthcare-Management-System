@@ -1,15 +1,22 @@
 import crypto from 'node:crypto';
 import express, { type Response } from 'express';
-import { desc, eq } from 'drizzle-orm';
 import { z } from 'zod';
 import {
   InterpretTurnInputSchema,
+  JarvisConverseInputSchema,
   OnboardingBootstrapSchema,
   SupportedLocaleSchema,
 } from '../contracts/api.ts';
-import { db } from '../db/index.ts';
-import { auditEvents, branches, memberships, users } from '../db/schema.ts';
-import { DomainError, ValidationError } from '../domain/errors.ts';
+import { db, isDatabaseConfigured } from '../db/index.ts';
+import { auditEvents } from '../db/schema.ts';
+import { updateUserPreferredLocale } from '../db/users.ts';
+import { ValidationError } from '../domain/errors.ts';
+import { addMemAuditEvent } from '../domain/memory-store.ts';
+import {
+  formatCombinedZReportCsv,
+  getCombinedZReport,
+} from '../domain/pharmacy-ops.ts';
+import { listTeamMembers, listWorkspaceAuditEvents } from '../domain/team-ops.ts';
 import {
   assertCapability,
   assertPermission,
@@ -20,11 +27,20 @@ import {
 } from '../domain/tenancy.ts';
 import { getAppointmentByIdForTenant, getTodayWorkspaceSummary } from '../domain/today.ts';
 import { interpretAdministrativeUtterance } from '../adapters/gemini.ts';
+import {
+  runJarvisConversationalTurn,
+  synthesizeJarvisSpeech,
+} from '../adapters/gemini-jarvis.ts';
 import { type AuthRequest, attachCorrelationId, requireAuth } from '../middleware/auth.ts';
 import { sendApiError } from './error-helper.ts';
 import { clinicRouter } from './clinic.ts';
+import { notificationsRouter } from './notifications.ts';
 import { pharmacyRouter } from './pharmacy.ts';
 import { platformRouter } from './platform.ts';
+import { billingRouter } from './billing.ts';
+import { accountsRouter } from './accounts.ts';
+import { purchasingRouter } from './purchasing.ts';
+import { hrAdminRouter } from './hr-admin.ts';
 
 export const apiV1Router = express.Router();
 
@@ -93,10 +109,7 @@ apiV1Router.post('/user/locale', requireAuth, async (req: AuthRequest, res) => {
       throw new ValidationError('Unsupported locale', 'errors.unsupported_locale');
     }
 
-    await db
-      .update(users)
-      .set({ preferredLocale: parsed.data.preferredLocale, updatedAt: new Date() })
-      .where(eq(users.id, req.authUser!.id));
+    await updateUserPreferredLocale(req.authUser!.id, parsed.data.preferredLocale);
 
     return res.json({
       preferredLocale: parsed.data.preferredLocale,
@@ -141,7 +154,7 @@ apiV1Router.get('/appointments/:id', requireAuth, async (req: AuthRequest, res) 
   }
 });
 
-// 6. Read-only Assistant Utterance Interpretation (never writes to DB)
+// 6. Legacy Read-only Assistant Utterance Interpretation
 apiV1Router.post('/assistant/interpret', requireAuth, async (req: AuthRequest, res) => {
   res.setHeader('Cache-Control', 'private, no-store');
   const correlationId = req.correlationId!;
@@ -163,26 +176,88 @@ apiV1Router.post('/assistant/interpret', requireAuth, async (req: AuthRequest, r
       businessDate,
     });
 
-    await db.insert(auditEvents).values({
-      tenantId: context.tenantId,
-      actorUserId: context.userId,
-      actorUid: context.uid,
-      action: 'assistant.utterance_interpreted',
-      entityType: 'assistant_turn',
-      entityId: crypto.randomUUID(),
-      inputSource: parsed.data.source,
-      correlationId,
-      metadataJson: {
-        intent: interpretation.intent,
-        status: interpretation.status,
-        modelVersion: interpretation.modelVersion,
-      },
-    });
+    if (!isDatabaseConfigured) {
+      addMemAuditEvent({
+        tenantId: context.tenantId,
+        actorUserId: context.userId,
+        actorUid: context.uid,
+        action: 'assistant.utterance_interpreted',
+        entityType: 'assistant_turn',
+        entityId: crypto.randomUUID(),
+        inputSource: parsed.data.source,
+        correlationId,
+        metadataJson: {
+          intent: interpretation.intent,
+          status: interpretation.status,
+          modelVersion: interpretation.modelVersion,
+        },
+      });
+    } else {
+      await db.insert(auditEvents).values({
+        tenantId: context.tenantId,
+        actorUserId: context.userId,
+        actorUid: context.uid,
+        action: 'assistant.utterance_interpreted',
+        entityType: 'assistant_turn',
+        entityId: crypto.randomUUID(),
+        inputSource: parsed.data.source,
+        correlationId,
+        metadataJson: {
+          intent: interpretation.intent,
+          status: interpretation.status,
+          modelVersion: interpretation.modelVersion,
+        },
+      });
+    }
 
     return res.json({
       interpretation,
       correlationId,
     });
+  } catch (error) {
+    return sendError(res, error, correlationId);
+  }
+});
+
+// 6b. J.A.R.V.I.S. Conversational Voice/Text Turn (Live Tool-Calling + Draft->Confirm + Quota)
+apiV1Router.post('/assistant/converse', requireAuth, async (req: AuthRequest, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  const correlationId = req.correlationId!;
+  try {
+    const requestedTenantId = req.header('x-tenant-id') || undefined;
+    const context = await requireActiveWorkspace(req.authUser!, requestedTenantId);
+    const parsed = JarvisConverseInputSchema.safeParse(req.body);
+    if (!parsed.success) {
+      throw new ValidationError(
+        parsed.error.issues[0]?.message || 'Invalid J.A.R.V.I.S. conversation input',
+        'errors.validation_failed'
+      );
+    }
+    const response = await runJarvisConversationalTurn(context, parsed.data, correlationId);
+    return res.json({ ...response, correlationId });
+  } catch (error) {
+    return sendError(res, error, correlationId);
+  }
+});
+
+// 6c. J.A.R.V.I.S. Speech Synthesis (Gemini TTS WAV or Browser SpeechSynthesis fallback)
+apiV1Router.post('/assistant/tts', requireAuth, async (req: AuthRequest, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  const correlationId = req.correlationId!;
+  try {
+    const requestedTenantId = req.header('x-tenant-id') || undefined;
+    const context = await requireActiveWorkspace(req.authUser!, requestedTenantId);
+    assertCapability(context, 'assistant.voice');
+    const schema = z.object({
+      text: z.string().trim().min(1).max(600),
+      locale: SupportedLocaleSchema.default('si-LK'),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      throw new ValidationError('Invalid TTS payload');
+    }
+    const speech = await synthesizeJarvisSpeech(parsed.data.text, parsed.data.locale);
+    return res.json({ ...speech, correlationId });
   } catch (error) {
     return sendError(res, error, correlationId);
   }
@@ -195,27 +270,8 @@ apiV1Router.get('/team', requireAuth, async (req: AuthRequest, res) => {
   try {
     const requestedTenantId = req.header('x-tenant-id') || undefined;
     const context = await requireActiveWorkspace(req.authUser!, requestedTenantId);
-
-    const rows = await db
-      .select({
-        membershipId: memberships.id,
-        userId: memberships.userId,
-        role: memberships.role,
-        active: memberships.active,
-        branchName: branches.name,
-        email: users.email,
-        displayName: users.displayName,
-        createdAt: memberships.createdAt,
-      })
-      .from(memberships)
-      .innerJoin(users, eq(memberships.userId, users.id))
-      .innerJoin(branches, eq(memberships.branchId, branches.id))
-      .where(eq(memberships.tenantId, context.tenantId));
-
-    return res.json({
-      members: rows,
-      correlationId,
-    });
+    const members = await listTeamMembers(context);
+    return res.json({ members, correlationId });
   } catch (error) {
     return sendError(res, error, correlationId);
   }
@@ -228,31 +284,54 @@ apiV1Router.get('/audit', requireAuth, async (req: AuthRequest, res) => {
   try {
     const requestedTenantId = req.header('x-tenant-id') || undefined;
     const context = await requireActiveWorkspace(req.authUser!, requestedTenantId);
-    assertPermission(context, 'audit.read');
-
-    const events = await db
-      .select({
-        id: auditEvents.id,
-        action: auditEvents.action,
-        entityType: auditEvents.entityType,
-        entityId: auditEvents.entityId,
-        inputSource: auditEvents.inputSource,
-        correlationId: auditEvents.correlationId,
-        metadataJson: auditEvents.metadataJson,
-        createdAt: auditEvents.createdAt,
-      })
-      .from(auditEvents)
-      .where(eq(auditEvents.tenantId, context.tenantId))
-      .orderBy(desc(auditEvents.createdAt))
-      .limit(50);
-
+    const events = await listWorkspaceAuditEvents(context);
     return res.json({ events, correlationId });
   } catch (error) {
     return sendError(res, error, correlationId);
   }
 });
 
-// 9. Modular Platform, Clinic Writes & Pharmacy Routers
+// 8b. Combined Daily Profit & Reconciliation Z-Report (JSON & CSV)
+apiV1Router.get('/reports/z-report', requireAuth, async (req: AuthRequest, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  const correlationId = req.correlationId!;
+  try {
+    const requestedTenantId = req.header('x-tenant-id') || undefined;
+    const context = await requireActiveWorkspace(req.authUser!, requestedTenantId);
+    const dateStr = typeof req.query.date === 'string' ? req.query.date : undefined;
+    const report = await getCombinedZReport(context, dateStr);
+    return res.json({ report, correlationId });
+  } catch (error) {
+    return sendError(res, error, correlationId);
+  }
+});
+
+apiV1Router.get('/reports/z-report.csv', requireAuth, async (req: AuthRequest, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  const correlationId = req.correlationId!;
+  try {
+    const requestedTenantId = req.header('x-tenant-id') || undefined;
+    const context = await requireActiveWorkspace(req.authUser!, requestedTenantId);
+    const dateStr = typeof req.query.date === 'string' ? req.query.date : undefined;
+    const report = await getCombinedZReport(context, dateStr);
+    const csv = formatCombinedZReportCsv(report);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="suwaseva-z-report-${report.businessDate}.csv"`
+    );
+    return res.send(csv);
+  } catch (error) {
+    return sendError(res, error, correlationId);
+  }
+});
+
+// 9. Modular Platform, Billing, Notifications, Clinic Writes, Pharmacy & Department Add-On Routers
 apiV1Router.use('/platform', platformRouter);
+apiV1Router.use('/billing', billingRouter);
+apiV1Router.use('/notifications', notificationsRouter);
 apiV1Router.use('/clinic', clinicRouter);
 apiV1Router.use('/pharmacy', pharmacyRouter);
+apiV1Router.use('/accounts', accountsRouter);
+apiV1Router.use('/purchasing', purchasingRouter);
+apiV1Router.use('/hr-admin', hrAdminRouter);

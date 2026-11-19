@@ -1,5 +1,6 @@
 import { initializeApp } from 'firebase/app';
 import {
+  browserLocalPersistence,
   browserSessionPersistence,
   getAuth,
   GoogleAuthProvider,
@@ -11,7 +12,17 @@ const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 export const googleAuthProvider = new GoogleAuthProvider();
 
-// Session-scoped persistence for shared-device safety (v4 §61.1)
-setPersistence(auth, browserSessionPersistence).catch((err) => {
-  console.error('Failed to configure session persistence:', err);
-});
+export async function configureAuthPersistence(rememberMe: boolean): Promise<void> {
+  try {
+    await setPersistence(
+      auth,
+      rememberMe ? browserLocalPersistence : browserSessionPersistence
+    );
+  } catch (err) {
+    console.error('Failed to configure auth persistence:', err);
+  }
+}
+
+// Default to session-scoped persistence for shared-device safety
+configureAuthPersistence(false);
+

@@ -120,45 +120,49 @@ export function OnboardingPage() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 py-8 px-4 sm:px-6">
+    <div className="min-h-screen neon-canvas py-8 px-4 sm:px-6 text-slate-100">
       <div className="max-w-2xl mx-auto space-y-6">
         <div className="flex items-center justify-between">
-          <span className="font-display text-lg font-bold text-slate-900">{t('brand')}</span>
+          <span className="font-display text-lg font-extrabold text-white">
+            Suwa<span className="neon-text-cyan">Seva</span>
+          </span>
           <button
             type="button"
             onClick={signOut}
-            className="text-xs font-medium text-slate-600 hover:text-slate-900 min-h-[40px] px-3"
+            className="text-xs font-medium text-slate-300 hover:text-cyan-200 min-h-[40px] px-3 rounded-lg neon-btn-secondary"
           >
             {t('auth.signOut')} ({session?.user.email})
           </button>
         </div>
 
-        <form
-          onSubmit={handleSubmit}
-          className="bg-white border border-slate-200 rounded-xl p-6 sm:p-8 space-y-6"
-        >
+        <form onSubmit={handleSubmit} className="neon-card-glow rounded-2xl p-6 sm:p-8 space-y-6">
           <div className="space-y-2">
-            <h1 className="font-display text-2xl font-bold text-slate-900">{t('onboarding.title')}</h1>
-            <p className="text-sm text-slate-600">{t('onboarding.subtitle')}</p>
+            <h1 className="font-display text-2xl font-bold neon-heading-glow">
+              {t('onboarding.title')}
+            </h1>
+            <p className="text-sm text-cyan-100/75">{t('onboarding.subtitle')}</p>
           </div>
 
           {errorMsg && (
-            <div role="alert" className="p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-800">
+            <div
+              role="alert"
+              className="p-3 bg-rose-950/70 border border-rose-400/50 rounded-xl text-sm text-rose-200"
+            >
               {errorMsg}
             </div>
           )}
 
           {/* 1. Language */}
           <fieldset className="space-y-2">
-            <legend className="text-sm font-medium text-slate-900">{t('onboarding.languageLabel')}</legend>
+            <legend className="text-sm font-medium text-cyan-100">{t('onboarding.languageLabel')}</legend>
             <div className="grid grid-cols-2 gap-3">
               <button
                 type="button"
                 onClick={() => handleLocaleSelect('si-LK')}
-                className={`min-h-[48px] px-4 rounded-lg border text-sm font-medium text-left transition-colors ${
+                className={`min-h-[48px] px-4 rounded-xl border text-sm font-semibold text-left transition-all ${
                   preferredLocale === 'si-LK'
-                    ? 'border-teal-700 bg-teal-50 text-teal-900'
-                    : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                    ? 'neon-card-glow neon-text-cyan'
+                    : 'bg-[#040e22]/80 border-cyan-500/20 text-slate-300 hover:border-cyan-400/50'
                 }`}
               >
                 සිංහල (Sinhala)
@@ -166,10 +170,10 @@ export function OnboardingPage() {
               <button
                 type="button"
                 onClick={() => handleLocaleSelect('en-LK')}
-                className={`min-h-[48px] px-4 rounded-lg border text-sm font-medium text-left transition-colors ${
+                className={`min-h-[48px] px-4 rounded-xl border text-sm font-semibold text-left transition-all ${
                   preferredLocale === 'en-LK'
-                    ? 'border-teal-700 bg-teal-50 text-teal-900'
-                    : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                    ? 'neon-card-glow neon-text-cyan'
+                    : 'bg-[#040e22]/80 border-cyan-500/20 text-slate-300 hover:border-cyan-400/50'
                 }`}
               >
                 English (Sri Lanka)
@@ -179,23 +183,23 @@ export function OnboardingPage() {
 
           {/* 2. Modular Product Package Mode */}
           <fieldset className="space-y-2">
-            <legend className="text-sm font-medium text-slate-900">{t('onboarding.productModeLabel')}</legend>
+            <legend className="text-sm font-medium text-cyan-100">{t('onboarding.productModeLabel')}</legend>
             <div className="grid sm:grid-cols-2 gap-3">
               {PRODUCT_MODES.map((opt) => (
                 <button
                   key={opt.mode}
                   type="button"
                   onClick={() => setProductMode(opt.mode)}
-                  className={`p-3.5 rounded-lg border text-left transition-colors space-y-1 ${
+                  className={`p-3.5 rounded-xl border text-left transition-all space-y-1 ${
                     productMode === opt.mode
-                      ? 'border-teal-700 bg-teal-50 text-teal-950'
-                      : 'border-slate-200 bg-white text-slate-800 hover:bg-slate-50'
+                      ? 'neon-card-glow'
+                      : 'bg-[#040e22]/80 border-cyan-500/20 text-slate-300 hover:border-cyan-400/50'
                   }`}
                 >
-                  <div className="text-sm font-semibold">
+                  <div className={`text-sm font-semibold ${productMode === opt.mode ? 'neon-text-cyan' : 'text-white'}`}>
                     {preferredLocale === 'si-LK' ? opt.labelSi : opt.labelEn}
                   </div>
-                  <div className="text-xs text-slate-600 leading-snug">{opt.descEn}</div>
+                  <div className="text-xs text-slate-300 leading-snug">{opt.descEn}</div>
                 </button>
               ))}
             </div>
@@ -204,104 +208,104 @@ export function OnboardingPage() {
           {/* 3. Organization, Legal Entity & Branch */}
           <div className="grid sm:grid-cols-2 gap-4">
             <label className="block space-y-1.5">
-              <span className="text-sm font-medium text-slate-900">{t('onboarding.clinicNameLabel')} *</span>
+              <span className="text-sm font-medium text-cyan-100">{t('onboarding.clinicNameLabel')} *</span>
               <input
                 required
                 minLength={2}
                 value={clinicName}
                 onChange={(e) => setClinicName(e.target.value)}
                 placeholder="e.g. Suwa Medical & Pharmacy"
-                className="w-full min-h-[44px] px-3 bg-white border border-slate-300 rounded-lg text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700"
+                className="w-full min-h-[44px] px-3 rounded-lg text-sm neon-input"
               />
             </label>
             <label className="block space-y-1.5">
-              <span className="text-sm font-medium text-slate-900">{t('onboarding.branchNameLabel')} *</span>
+              <span className="text-sm font-medium text-cyan-100">{t('onboarding.branchNameLabel')} *</span>
               <input
                 required
                 minLength={2}
                 value={branchName}
                 onChange={(e) => setBranchName(e.target.value)}
-                className="w-full min-h-[44px] px-3 bg-white border border-slate-300 rounded-lg text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700"
+                className="w-full min-h-[44px] px-3 rounded-lg text-sm neon-input"
               />
             </label>
             <label className="block space-y-1.5 sm:col-span-2">
-              <span className="text-sm font-medium text-slate-900">{t('onboarding.legalEntityLabel')}</span>
+              <span className="text-sm font-medium text-cyan-100">{t('onboarding.legalEntityLabel')}</span>
               <input
                 value={legalEntityName}
                 onChange={(e) => setLegalEntityName(e.target.value)}
                 placeholder="Defaults to Business Name if left blank"
-                className="w-full min-h-[44px] px-3 bg-white border border-slate-300 rounded-lg text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700"
+                className="w-full min-h-[44px] px-3 rounded-lg text-sm neon-input"
               />
             </label>
           </div>
 
           {/* 4. Explicit Country / Timezone / Currency Confirmation */}
-          <div className="p-4 bg-slate-50 border border-slate-200 rounded-lg space-y-3">
-            <p className="text-xs font-mono-tabular text-slate-700">{t('onboarding.countryRegionBox')}</p>
+          <div className="p-4 bg-[#040e22]/90 border border-cyan-500/25 rounded-xl space-y-3">
+            <p className="text-xs font-mono-tabular text-cyan-300">{t('onboarding.countryRegionBox')}</p>
             <label className="flex items-start gap-3 cursor-pointer">
               <input
                 type="checkbox"
                 checked={confirmRegion}
                 onChange={(e) => setConfirmRegion(e.target.checked)}
-                className="mt-1 w-4 h-4 accent-teal-700"
+                className="mt-1 w-4 h-4 accent-cyan-400"
               />
-              <span className="text-sm text-slate-800">{t('onboarding.confirmRegionCheck')}</span>
+              <span className="text-sm text-slate-200">{t('onboarding.confirmRegionCheck')}</span>
             </label>
           </div>
 
-          {/* 5. Clinic Practitioner & Primary Service (shown only when Clinic module enabled) */}
+          {/* 5. Clinic Practitioner & Primary Service */}
           {hasClinic && (
             <>
               <div className="grid sm:grid-cols-3 gap-4">
                 <label className="block space-y-1.5 sm:col-span-1">
-                  <span className="text-sm font-medium text-slate-900">{t('onboarding.practitionerLabel')} *</span>
+                  <span className="text-sm font-medium text-cyan-100">{t('onboarding.practitionerLabel')} *</span>
                   <input
                     required
                     minLength={2}
                     value={practitionerName}
                     onChange={(e) => setPractitionerName(e.target.value)}
                     placeholder="Dr. Perera"
-                    className="w-full min-h-[44px] px-3 bg-white border border-slate-300 rounded-lg text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700"
+                    className="w-full min-h-[44px] px-3 rounded-lg text-sm neon-input"
                   />
                 </label>
                 <label className="block space-y-1.5">
-                  <span className="text-sm font-medium text-slate-900">{t('onboarding.specialtyLabel')}</span>
+                  <span className="text-sm font-medium text-cyan-100">{t('onboarding.specialtyLabel')}</span>
                   <input
                     value={specialty}
                     onChange={(e) => setSpecialty(e.target.value)}
-                    className="w-full min-h-[44px] px-3 bg-white border border-slate-300 rounded-lg text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700"
+                    className="w-full min-h-[44px] px-3 rounded-lg text-sm neon-input"
                   />
                 </label>
                 <label className="block space-y-1.5">
-                  <span className="text-sm font-medium text-slate-900">{t('onboarding.hoursLabel')}</span>
+                  <span className="text-sm font-medium text-cyan-100">{t('onboarding.hoursLabel')}</span>
                   <input
                     value={openingHours}
                     onChange={(e) => setOpeningHours(e.target.value)}
-                    className="w-full min-h-[44px] px-3 bg-white border border-slate-300 rounded-lg text-sm font-mono-tabular focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700"
+                    className="w-full min-h-[44px] px-3 rounded-lg text-sm font-mono-tabular neon-input"
                   />
                 </label>
               </div>
 
               <div className="grid sm:grid-cols-2 gap-4">
                 <label className="block space-y-1.5">
-                  <span className="text-sm font-medium text-slate-900">{t('onboarding.serviceNameLabel')} *</span>
+                  <span className="text-sm font-medium text-cyan-100">{t('onboarding.serviceNameLabel')} *</span>
                   <input
                     required
                     value={serviceName}
                     onChange={(e) => setServiceName(e.target.value)}
-                    className="w-full min-h-[44px] px-3 bg-white border border-slate-300 rounded-lg text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700"
+                    className="w-full min-h-[44px] px-3 rounded-lg text-sm neon-input"
                   />
                 </label>
                 <label className="block space-y-1.5">
-                  <span className="text-sm font-medium text-slate-900">{t('onboarding.serviceNameSiLabel')}</span>
+                  <span className="text-sm font-medium text-cyan-100">{t('onboarding.serviceNameSiLabel')}</span>
                   <input
                     value={serviceNameSi}
                     onChange={(e) => setServiceNameSi(e.target.value)}
-                    className="w-full min-h-[44px] px-3 bg-white border border-slate-300 rounded-lg text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700"
+                    className="w-full min-h-[44px] px-3 rounded-lg text-sm neon-input"
                   />
                 </label>
                 <label className="block space-y-1.5">
-                  <span className="text-sm font-medium text-slate-900">{t('onboarding.durationLabel')} *</span>
+                  <span className="text-sm font-medium text-cyan-100">{t('onboarding.durationLabel')} *</span>
                   <input
                     type="number"
                     min={5}
@@ -309,11 +313,11 @@ export function OnboardingPage() {
                     required
                     value={durationMinutes}
                     onChange={(e) => setDurationMinutes(Number(e.target.value))}
-                    className="w-full min-h-[44px] px-3 bg-white border border-slate-300 rounded-lg text-sm font-mono-tabular focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700"
+                    className="w-full min-h-[44px] px-3 rounded-lg text-sm font-mono-tabular neon-input"
                   />
                 </label>
                 <label className="block space-y-1.5">
-                  <span className="text-sm font-medium text-slate-900">{t('onboarding.priceLabel')} *</span>
+                  <span className="text-sm font-medium text-cyan-100">{t('onboarding.priceLabel')} *</span>
                   <input
                     type="number"
                     min={0}
@@ -321,19 +325,19 @@ export function OnboardingPage() {
                     required
                     value={priceLkr}
                     onChange={(e) => setPriceLkr(Number(e.target.value))}
-                    className="w-full min-h-[44px] px-3 bg-white border border-slate-300 rounded-lg text-sm font-mono-tabular focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700"
+                    className="w-full min-h-[44px] px-3 rounded-lg text-sm font-mono-tabular neon-input"
                   />
                 </label>
               </div>
 
-              <label className="flex items-start gap-3 p-4 bg-slate-50 border border-slate-200 rounded-lg cursor-pointer">
+              <label className="flex items-start gap-3 p-4 bg-[#040e22]/90 border border-cyan-500/20 rounded-xl cursor-pointer">
                 <input
                   type="checkbox"
                   checked={includeSampleData}
                   onChange={(e) => setIncludeSampleData(e.target.checked)}
-                  className="mt-1 w-4 h-4 accent-teal-700"
+                  className="mt-1 w-4 h-4 accent-cyan-400"
                 />
-                <span className="text-sm text-slate-800">{t('onboarding.sampleToggle')}</span>
+                <span className="text-sm text-slate-200">{t('onboarding.sampleToggle')}</span>
               </label>
             </>
           )}
@@ -341,7 +345,7 @@ export function OnboardingPage() {
           <button
             type="submit"
             disabled={submitting}
-            className="w-full min-h-[48px] px-5 bg-teal-700 hover:bg-teal-800 disabled:opacity-60 text-white font-medium rounded-lg inline-flex items-center justify-center gap-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700 focus-visible:ring-offset-2"
+            className="w-full min-h-[48px] px-5 rounded-xl neon-btn-primary inline-flex items-center justify-center gap-2 disabled:opacity-60"
           >
             <CheckCircle2 className="w-5 h-5" aria-hidden="true" />
             <span>{submitting ? t('onboarding.submitting') : t('onboarding.submitButton')}</span>

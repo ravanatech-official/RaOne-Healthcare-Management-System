@@ -2,7 +2,7 @@ import 'dotenv/config';
 import crypto from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { and, eq } from 'drizzle-orm';
-import { db } from '../src/db/index.ts';
+import { db, isDatabaseConfigured } from '../src/db/index.ts';
 import {
   charges,
   inventoryBalances,
@@ -92,9 +92,7 @@ describe('Unit Invariants: POS Cart-Hash Integrity', () => {
   });
 });
 
-const hasSqlEnv = Boolean(
-  process.env.SQL_HOST && process.env.SQL_USER && process.env.SQL_PASSWORD && process.env.SQL_DB_NAME
-);
+const hasSqlEnv = isDatabaseConfigured;
 
 describe.skipIf(!hasSqlEnv)('Clinic Write Slice & Pharmacy Phase 2 POS Integration (Cloud SQL)', () => {
   const tag = crypto.randomBytes(4).toString('hex');

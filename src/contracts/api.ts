@@ -46,6 +46,11 @@ export const CapabilityKeySchema = z.enum([
   'assistant.text',
   'assistant.voice',
   'exports.csv',
+  // Department Add-On Packs
+  'accounts.ledger',
+  'purchasing.orders',
+  'hr.management',
+  'admin.operations',
 ]);
 export type CapabilityKey = z.infer<typeof CapabilityKeySchema>;
 
@@ -70,7 +75,18 @@ export type PermissionKey =
   | 'pharmacy.pos.sell'
   | 'pharmacy.lot.quarantine_place'
   | 'platform.capabilities.manage'
-  | 'platform.grants.manage';
+  | 'platform.grants.manage'
+  | 'billing.read'
+  | 'billing.manage'
+  | 'accounts.read'
+  | 'accounts.write'
+  | 'purchasing.read'
+  | 'purchasing.write'
+  | 'purchasing.approve'
+  | 'hr.attendance.self'
+  | 'hr.manage'
+  | 'hr.payroll.manage'
+  | 'admin.ops.manage';
 
 export const ROLE_PERMISSIONS: Record<Role, readonly PermissionKey[]> = {
   owner: [
@@ -95,6 +111,17 @@ export const ROLE_PERMISSIONS: Record<Role, readonly PermissionKey[]> = {
     'pharmacy.lot.quarantine_place',
     'platform.capabilities.manage',
     'platform.grants.manage',
+    'billing.read',
+    'billing.manage',
+    'accounts.read',
+    'accounts.write',
+    'purchasing.read',
+    'purchasing.write',
+    'purchasing.approve',
+    'hr.attendance.self',
+    'hr.manage',
+    'hr.payroll.manage',
+    'admin.ops.manage',
   ],
   manager: [
     'directory.read',
@@ -111,6 +138,15 @@ export const ROLE_PERMISSIONS: Record<Role, readonly PermissionKey[]> = {
     'pharmacy.stock.read',
     'pharmacy.pos.sell',
     'pharmacy.lot.quarantine_place',
+    'billing.read',
+    'accounts.read',
+    'accounts.write',
+    'purchasing.read',
+    'purchasing.write',
+    'purchasing.approve',
+    'hr.attendance.self',
+    'hr.manage',
+    'admin.ops.manage',
   ],
   receptionist: [
     'directory.read',
@@ -119,6 +155,9 @@ export const ROLE_PERMISSIONS: Record<Role, readonly PermissionKey[]> = {
     'attendance.write',
     'payments.record',
     'reports.branch_summary',
+    'accounts.read',
+    'hr.attendance.self',
+    'admin.ops.manage',
   ],
   cashier: [
     'directory.read',
@@ -127,6 +166,7 @@ export const ROLE_PERMISSIONS: Record<Role, readonly PermissionKey[]> = {
     'pharmacy.catalogue.read',
     'pharmacy.stock.read',
     'pharmacy.pos.sell',
+    'hr.attendance.self',
   ],
   stock_keeper: [
     'pharmacy.catalogue.read',
@@ -134,6 +174,10 @@ export const ROLE_PERMISSIONS: Record<Role, readonly PermissionKey[]> = {
     'pharmacy.receiving.write',
     'pharmacy.stock.read',
     'pharmacy.lot.quarantine_place',
+    'purchasing.read',
+    'purchasing.write',
+    'hr.attendance.self',
+    'admin.ops.manage',
   ],
   accountant: [
     'reports.branch_summary',
@@ -142,6 +186,13 @@ export const ROLE_PERMISSIONS: Record<Role, readonly PermissionKey[]> = {
     'pharmacy.catalogue.read',
     'pharmacy.stock.read',
     'pharmacy.invoice.write',
+    'billing.read',
+    'accounts.read',
+    'accounts.write',
+    'purchasing.read',
+    'hr.attendance.self',
+    'hr.manage',
+    'hr.payroll.manage',
   ],
 };
 
@@ -246,6 +297,7 @@ export interface TodayAppointmentItem {
   personId: string;
   personName: string;
   phoneLast4: string;
+  phone?: string;
   serviceId: string;
   serviceName: string;
   serviceNameSi: string;
@@ -254,6 +306,8 @@ export interface TodayAppointmentItem {
   bookedDurationMinutes: number;
   bookedPriceMinor: number;
   currency: string;
+  tokenNumber?: number;
+  queueState?: 'waiting' | 'serving' | 'completed' | 'skipped';
   isSample: boolean;
   version: number;
 }
@@ -291,3 +345,288 @@ export interface TodaySummaryResponse {
     specialty: string;
   }>;
 }
+
+// SaaS Subscription & Monthly Client Billing Contracts
+export const BillingCycleSchema = z.enum(['monthly', 'annual']);
+export type BillingCycle = z.infer<typeof BillingCycleSchema>;
+
+export const SubscriptionPaymentMethodSchema = z.enum(['card', 'lankaqr', 'bank_transfer']);
+export type SubscriptionPaymentMethod = z.infer<typeof SubscriptionPaymentMethodSchema>;
+
+export const UpdateSubscriptionPlanSchema = z.object({
+  planCode: ProductModeSchema,
+  billingCycle: BillingCycleSchema,
+  autoRenew: z.boolean().optional(),
+});
+export type UpdateSubscriptionPlanInput = z.infer<typeof UpdateSubscriptionPlanSchema>;
+
+export const GenerateSubscriptionInvoiceSchema = z.object({
+  billingCycle: BillingCycleSchema.optional(),
+});
+export type GenerateSubscriptionInvoiceInput = z.infer<typeof GenerateSubscriptionInvoiceSchema>;
+
+export const PaySubscriptionInvoiceSchema = z.object({
+  idempotencyKey: z.string().trim().min(8).max(120),
+  invoiceId: z.string().trim().min(4).max(120),
+  method: SubscriptionPaymentMethodSchema,
+  savePaymentMethod: z.boolean().default(true),
+  cardHolderName: z.string().trim().max(120).optional().default(''),
+  cardNumber: z.string().trim().max(32).optional().default(''),
+  cardExpiry: z.string().trim().max(10).optional().default(''),
+  bankName: z.string().trim().max(100).optional().default(''),
+  bankReference: z.string().trim().max(100).optional().default(''),
+});
+export type PaySubscriptionInvoiceInput = z.infer<typeof PaySubscriptionInvoiceSchema>;
+
+export const PayHereWebhookSchema = z.object({
+  merchant_id: z.string().trim().min(2),
+  order_id: z.string().trim().min(4),
+  payment_id: z.string().trim().min(2),
+  payhere_amount: z.string().trim().min(1),
+  payhere_currency: z.string().trim().default('LKR'),
+  status_code: z.string().trim().min(1),
+  md5sig: z.string().trim().min(8),
+  method: z.string().trim().optional().default('VISA'),
+  card_holder_name: z.string().trim().optional().default(''),
+  card_no: z.string().trim().optional().default(''),
+  card_expiry: z.string().trim().optional().default(''),
+  recurring_token: z.string().trim().optional().default(''),
+  gateway_provider: z.enum(['payhere', 'webxpay', 'genie']).optional().default('payhere'),
+});
+export type PayHereWebhookInput = z.infer<typeof PayHereWebhookSchema>;
+
+export interface SubscriptionPlanDefinition {
+  planCode: ProductMode;
+  nameEn: string;
+  nameSi: string;
+  audienceEn: string;
+  monthlyMinor: number;
+  annualMinor: number;
+  currency: 'LKR';
+  staffLimit: number;
+  branchLimit: number;
+  counterLimit: number;
+  voiceTurnsLimit: number;
+  highlightsEn: string[];
+  highlightsSi: string[];
+}
+
+export interface SubscriptionInvoiceItem {
+  id: string;
+  invoiceNumber: string;
+  planCode: ProductMode;
+  billingCycle: BillingCycle;
+  description: string;
+  billingPeriodStart: string;
+  billingPeriodEnd: string;
+  dueDate: string;
+  subtotalMinor: number;
+  discountMinor: number;
+  totalMinor: number;
+  paidMinor: number;
+  currency: string;
+  status: 'open' | 'paid' | 'past_due' | 'void';
+  issuedAt: string;
+  paidAt: string | null;
+}
+
+export interface SubscriptionPaymentItem {
+  id: string;
+  invoiceId: string;
+  invoiceNumber: string;
+  amountMinor: number;
+  currency: string;
+  method: SubscriptionPaymentMethod;
+  gatewayProvider: string;
+  gatewayReference: string;
+  cardBrand: string;
+  cardLast4: string;
+  bankName: string;
+  bankReference: string;
+  status: 'succeeded' | 'pending_verification' | 'failed';
+  receiptNumber: string;
+  paidAt: string;
+}
+
+export interface TrialGraceStatus {
+  status: 'trialing' | 'active' | 'grace_read_only' | 'past_due' | 'suspended';
+  trialDaysRemaining: number;
+  graceDaysRemaining: number;
+  isReadOnlyGrace: boolean;
+  trialEndsAt: string;
+  graceEndsAt: string;
+  bannerMessageEn: string;
+  bannerMessageSi: string;
+}
+
+export interface WorkspaceQuotaSummary {
+  periodMonth: string;
+  staffUsed: number;
+  staffLimit: number;
+  branchesUsed: number;
+  branchLimit: number;
+  countersUsed: number;
+  counterLimit: number;
+  voiceTurnsUsed: number;
+  voiceTurnsLimit: number;
+  whatsappSentCount: number;
+  smsSentCount: number;
+  overageAlerts: Array<{
+    resource: 'staff' | 'branches' | 'counters' | 'voice_turns';
+    used: number;
+    limit: number;
+    severity: 'warning' | 'exceeded';
+    message: string;
+  }>;
+}
+
+export interface TenantSubscriptionOverview {
+  subscription: {
+    id: string;
+    tenantId: string;
+    planCode: ProductMode;
+    billingCycle: BillingCycle;
+    status: 'trialing' | 'active' | 'past_due' | 'suspended' | 'cancelled';
+    monthlyAmountMinor: number;
+    effectiveCycleAmountMinor: number;
+    currency: string;
+    currentPeriodStart: string;
+    currentPeriodEnd: string;
+    nextBillingDate: string;
+    autoRenew: boolean;
+    paymentMethodType: 'card' | 'lankaqr' | 'bank_transfer' | 'none';
+    paymentMethodLabel: string;
+    gatewayProvider: string;
+    recurringTokenActive: boolean;
+    trialEndsAt: string;
+    graceEndsAt: string;
+    lastWebhookAt: string | null;
+  };
+  trialGrace: TrialGraceStatus;
+  quotas: WorkspaceQuotaSummary;
+  plans: SubscriptionPlanDefinition[];
+  invoices: SubscriptionInvoiceItem[];
+  payments: SubscriptionPaymentItem[];
+  outstandingMinor: number;
+  bankTransferInstructions: {
+    accountName: string;
+    bankName: string;
+    branchName: string;
+    accountNumber: string;
+    referenceHint: string;
+  };
+}
+
+// WhatsApp & SMS Notification Contracts
+export const NotificationChannelSchema = z.enum(['whatsapp', 'sms']);
+export const NotificationProviderSchema = z.enum([
+  'whatsapp_cloud',
+  'notify_lk',
+  'dialog_sms',
+  'mobitel_sms',
+]);
+export const NotificationTemplateSchema = z.enum([
+  'invoice_due',
+  'payment_receipt',
+  'appointment_reminder',
+  'queue_token',
+  'doctor_delay',
+]);
+
+export const SendNotificationSchema = z.object({
+  channel: NotificationChannelSchema,
+  provider: NotificationProviderSchema.default('notify_lk'),
+  templateType: NotificationTemplateSchema,
+  recipientPhone: z.string().trim().min(7).max(24),
+  recipientName: z.string().trim().max(120).optional().default(''),
+  messageBody: z.string().trim().min(5).max(800),
+  entityType: z.string().trim().max(60).optional().default(''),
+  entityId: z.string().trim().max(120).optional().default(''),
+});
+export type SendNotificationInput = z.infer<typeof SendNotificationSchema>;
+
+export interface NotificationDispatchItem {
+  id: string;
+  channel: 'whatsapp' | 'sms';
+  provider: string;
+  templateType: string;
+  recipientPhone: string;
+  recipientName: string;
+  messageBody: string;
+  status: string;
+  entityType: string;
+  entityId: string;
+  externalRef: string;
+  whatsappDeepLink?: string;
+  sentAt: string;
+}
+
+// Team Invites, Branches & Shift PIN Contracts
+export const CreateBranchSchema = z.object({
+  name: z.string().trim().min(2).max(100),
+  code: z.string().trim().min(2).max(20),
+  openingHoursSummary: z.string().trim().max(120).optional().default('08:30 - 18:00'),
+});
+export type CreateBranchInput = z.infer<typeof CreateBranchSchema>;
+
+export const CreateStaffInviteSchema = z.object({
+  email: z.string().trim().email(),
+  displayName: z.string().trim().min(2).max(120).optional().default(''),
+  role: RoleSchema,
+  branchId: z.string().trim().min(4),
+});
+export type CreateStaffInviteInput = z.infer<typeof CreateStaffInviteSchema>;
+
+export const SetShiftPinSchema = z.object({
+  pin: z.string().trim().regex(/^\d{4,6}$/, 'PIN must be 4 to 6 digits'),
+});
+
+export const VerifyShiftPinSchema = z.object({
+  pin: z.string().trim().regex(/^\d{4,6}$/, 'PIN must be 4 to 6 digits'),
+});
+
+// J.A.R.V.I.S. Conversational Voice Engine Contracts
+export const JarvisConverseInputSchema = z.object({
+  sessionId: z.string().trim().min(4).max(120).default('jarvis-default'),
+  message: z.string().trim().min(1).max(1000),
+  locale: SupportedLocaleSchema.default('si-LK'),
+  source: z.enum(['voice', 'text']).default('voice'),
+  history: z
+    .array(
+      z.object({
+        role: z.enum(['user', 'assistant']),
+        text: z.string().max(1000),
+      })
+    )
+    .max(12)
+    .optional()
+    .default([]),
+});
+export type JarvisConverseInput = z.infer<typeof JarvisConverseInputSchema>;
+
+export interface JarvisConverseResponse {
+  sessionId: string;
+  replyText: string;
+  replySpeechText: string;
+  detectedLanguage: 'si-LK' | 'en-LK' | 'mixed';
+  intent: string;
+  toolCallsExecuted: Array<{
+    tool: string;
+    summary: string;
+  }>;
+  proposedAction: {
+    actionType: 'create_appointment' | 'record_payment';
+    proposalId: string;
+    nonce: string;
+    payload: Record<string, unknown>;
+    summaryLabel: string;
+  } | null;
+  quickFollowUps: string[];
+  quota: {
+    voiceTurnsUsed: number;
+    voiceTurnsLimit: number;
+  };
+  modelVersion: string;
+}
+
+

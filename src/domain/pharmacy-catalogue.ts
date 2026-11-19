@@ -1,5 +1,6 @@
+import crypto from 'node:crypto';
 import { and, asc, desc, eq, ilike, ne, or } from 'drizzle-orm';
-import { db } from '../db/index.ts';
+import { db, isDatabaseConfigured } from '../db/index.ts';
 import {
   auditEvents,
   barcodeAliases,
@@ -13,6 +14,8 @@ import {
   NotFoundError,
   ValidationError,
 } from './errors.ts';
+import { addMemAuditEvent, getMemoryStore } from './memory-store.ts';
+import { assertWorkspaceNotReadOnlyGrace } from './subscription-billing.ts';
 import {
   assertCapability,
   assertPermission,
@@ -38,6 +41,56 @@ export async function listCatalogueProducts(
   assertPermission(context, 'pharmacy.catalogue.read');
 
   const trimmed = query?.trim() || '';
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const pattern = trimmed.toLowerCase();
+    const matchedByBarcode = trimmed
+      ? new Set(
+          store.barcodeAliases
+            .filter((b) => b.tenantId === context.tenantId && b.barcode === trimmed)
+            .map((b) => b.productId)
+        )
+      : new Set<string>();
+
+    const productRows = store.products
+      .filter((p) => {
+        if (p.tenantId !== context.tenantId) return false;
+        if (context.legalEntityId && p.legalEntityId !== context.legalEntityId) return false;
+        if (!trimmed) return true;
+        return (
+          matchedByBarcode.has(p.id) ||
+          p.skuCode.toLowerCase().includes(pattern) ||
+          p.displayName.toLowerCase().includes(pattern) ||
+          p.genericName.toLowerCase().includes(pattern) ||
+          p.brandName.toLowerCase().includes(pattern)
+        );
+      })
+      .sort((a, b) => a.displayName.localeCompare(b.displayName))
+      .slice(0, 100);
+
+    const items = productRows.map((p) => ({
+      ...p,
+      variants: store.packVariants
+        .filter((v) => v.tenantId === context.tenantId && v.productId === p.id)
+        .sort((a, b) => a.variantName.localeCompare(b.variantName))
+        .map((v) => ({
+          ...v,
+          conversionHistory: store.uomConversions
+            .filter((c) => c.tenantId === context.tenantId && c.packVariantId === v.id)
+            .sort((a, b) => b.version - a.version),
+          barcodes: store.barcodeAliases
+            .filter((b) => b.tenantId === context.tenantId && b.packVariantId === v.id)
+            .sort((a, b) => a.barcode.localeCompare(b.barcode)),
+        })),
+    }));
+
+    return {
+      items,
+      ambiguityWarning: Boolean(trimmed && items.length > 1),
+    };
+  }
+
   const whereClauses = [eq(products.tenantId, context.tenantId)];
   if (context.legalEntityId) {
     whereClauses.push(eq(products.legalEntityId, context.legalEntityId));
@@ -133,9 +186,128 @@ export async function createProduct(
 ) {
   assertCapability(context, 'pharmacy.catalogue');
   assertPermission(context, 'pharmacy.catalogue.write');
+  await assertWorkspaceNotReadOnlyGrace(context.tenantId, context.timezone);
 
   if (!context.legalEntityId) {
     throw new ValidationError('Active branch must belong to a legal entity before adding SKUs');
+  }
+
+  const requiresPharmacistRelease = input.regulatoryClass !== 'otc';
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const dup = store.products.find(
+      (p) => p.tenantId === context.tenantId && p.skuCode === input.skuCode.trim()
+    );
+    if (dup) {
+      throw new ConflictError(
+        `SKU code "${input.skuCode}" already exists in this workspace`,
+        'DUPLICATE_SKU'
+      );
+    }
+
+    const now = new Date();
+    const product = {
+      id: crypto.randomUUID(),
+      tenantId: context.tenantId,
+      legalEntityId: context.legalEntityId,
+      skuCode: input.skuCode.trim(),
+      displayName: input.displayName.trim(),
+      normalizedName: normalizeSearchName(
+        `${input.displayName} ${input.genericName} ${input.brandName} ${input.strengthValue}${input.strengthUnit}`
+      ),
+      genericName: input.genericName.trim(),
+      brandName: input.brandName?.trim() || '',
+      strengthValue: input.strengthValue.trim(),
+      strengthUnit: input.strengthUnit.trim(),
+      dosageForm: input.dosageForm,
+      route: input.route?.trim() || 'oral',
+      manufacturer: input.manufacturer.trim(),
+      regulatoryClass: input.regulatoryClass,
+      requiresPharmacistRelease,
+      storageCondition: input.storageCondition,
+      baseUnit: input.baseUnit,
+      minShelfLifeDays: input.minShelfLifeDays,
+      active: true,
+      createdAt: now,
+      updatedAt: now,
+    };
+    store.products.push(product);
+
+    let createdVariant = null;
+    let barcodeConflict = false;
+    if (input.initialPack) {
+      const variant = {
+        id: crypto.randomUUID(),
+        tenantId: context.tenantId,
+        productId: product.id,
+        variantName: input.initialPack.variantName.trim(),
+        packUnit: input.initialPack.packUnit,
+        currentBaseQty: input.initialPack.baseQtyPerPack,
+        currentConversionVersion: 1,
+        defaultSalePriceMinor: input.initialPack.defaultSalePriceMinor,
+        currency: context.currency,
+        allowPosSale: true,
+        active: true,
+        createdAt: now,
+        updatedAt: now,
+      };
+      store.packVariants.push(variant);
+      store.uomConversions.push({
+        id: crypto.randomUUID(),
+        tenantId: context.tenantId,
+        productId: product.id,
+        packVariantId: variant.id,
+        version: 1,
+        packUnit: variant.packUnit,
+        baseUnit: product.baseUnit,
+        baseQtyPerPack: input.initialPack.baseQtyPerPack,
+        effectiveFrom: now,
+        createdByUserId: context.userId,
+        notes: 'Initial pack conversion',
+        createdAt: now,
+      });
+
+      if (input.initialPack.barcode) {
+        const cleanCode = input.initialPack.barcode.trim();
+        barcodeConflict = store.barcodeAliases.some(
+          (b) => b.tenantId === context.tenantId && b.barcode === cleanCode
+        );
+        store.barcodeAliases.push({
+          id: crypto.randomUUID(),
+          tenantId: context.tenantId,
+          productId: product.id,
+          packVariantId: variant.id,
+          barcode: cleanCode,
+          barcodeType: input.initialPack.barcodeType,
+          status: barcodeConflict ? 'conflict_review' : 'active',
+          createdAt: now,
+        });
+      }
+      createdVariant = variant;
+    }
+
+    addMemAuditEvent({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'pharmacy.product_created',
+      entityType: 'product',
+      entityId: product.id,
+      correlationId,
+      metadataJson: {
+        skuCode: product.skuCode,
+        regulatoryClass: product.regulatoryClass,
+        requiresPharmacistRelease: product.requiresPharmacistRelease,
+        barcodeConflict,
+      },
+    });
+
+    return {
+      product,
+      initialPackVariant: createdVariant,
+      barcodeConflict,
+    };
   }
 
   const existingSku = await db
@@ -155,8 +327,6 @@ export async function createProduct(
       'DUPLICATE_SKU'
     );
   }
-
-  const requiresPharmacistRelease = input.regulatoryClass !== 'otc';
 
   const result = await db.transaction(async (tx) => {
     const [product] = await tx
@@ -284,6 +454,79 @@ export async function addPackVariant(
 ) {
   assertCapability(context, 'pharmacy.catalogue');
   assertPermission(context, 'pharmacy.catalogue.write');
+  await assertWorkspaceNotReadOnlyGrace(context.tenantId, context.timezone);
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const product = store.products.find(
+      (p) => p.id === productId && p.tenantId === context.tenantId
+    );
+    if (!product) throw new NotFoundError('Product not found');
+
+    const now = new Date();
+    const variant = {
+      id: crypto.randomUUID(),
+      tenantId: context.tenantId,
+      productId: product.id,
+      variantName: input.variantName.trim(),
+      packUnit: input.packUnit,
+      currentBaseQty: input.baseQtyPerPack,
+      currentConversionVersion: 1,
+      defaultSalePriceMinor: input.defaultSalePriceMinor,
+      currency: context.currency,
+      allowPosSale: input.allowPosSale,
+      active: true,
+      createdAt: now,
+      updatedAt: now,
+    };
+    store.packVariants.push(variant);
+    const conversion = {
+      id: crypto.randomUUID(),
+      tenantId: context.tenantId,
+      productId: product.id,
+      packVariantId: variant.id,
+      version: 1,
+      packUnit: variant.packUnit,
+      baseUnit: product.baseUnit,
+      baseQtyPerPack: input.baseQtyPerPack,
+      effectiveFrom: now,
+      createdByUserId: context.userId,
+      notes: 'Initial pack conversion',
+      createdAt: now,
+    };
+    store.uomConversions.push(conversion);
+
+    let barcodeConflict = false;
+    if (input.barcode) {
+      const cleanCode = input.barcode.trim();
+      barcodeConflict = store.barcodeAliases.some(
+        (b) => b.tenantId === context.tenantId && b.barcode === cleanCode
+      );
+      store.barcodeAliases.push({
+        id: crypto.randomUUID(),
+        tenantId: context.tenantId,
+        productId: product.id,
+        packVariantId: variant.id,
+        barcode: cleanCode,
+        barcodeType: input.barcodeType,
+        status: barcodeConflict ? 'conflict_review' : 'active',
+        createdAt: now,
+      });
+    }
+
+    addMemAuditEvent({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'pharmacy.pack_variant_created',
+      entityType: 'pack_variant',
+      entityId: variant.id,
+      correlationId,
+      metadataJson: { productId: product.id, baseQtyPerPack: input.baseQtyPerPack, barcodeConflict },
+    });
+
+    return { variant, conversion, barcodeConflict };
+  }
 
   const [product] = await db
     .select()
@@ -383,6 +626,65 @@ export async function updatePackConversion(
 ) {
   assertCapability(context, 'pharmacy.catalogue');
   assertPermission(context, 'pharmacy.catalogue.write');
+  await assertWorkspaceNotReadOnlyGrace(context.tenantId, context.timezone);
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const variant = store.packVariants.find(
+      (v) => v.id === packVariantId && v.tenantId === context.tenantId
+    );
+    if (!variant) throw new NotFoundError('Pack variant not found');
+    const product = store.products.find(
+      (p) => p.id === variant.productId && p.tenantId === context.tenantId
+    );
+    if (!product) throw new NotFoundError('Parent product not found');
+
+    const prevVersion = variant.currentConversionVersion;
+    const prevQty = variant.currentBaseQty;
+    const nextVersion = prevVersion + 1;
+    const now = new Date();
+
+    const newConversion = {
+      id: crypto.randomUUID(),
+      tenantId: context.tenantId,
+      productId: product.id,
+      packVariantId: variant.id,
+      version: nextVersion,
+      packUnit: variant.packUnit,
+      baseUnit: product.baseUnit,
+      baseQtyPerPack: input.newBaseQtyPerPack,
+      effectiveFrom: now,
+      createdByUserId: context.userId,
+      notes: input.notes.trim(),
+      createdAt: now,
+    };
+    store.uomConversions.push(newConversion);
+
+    variant.currentBaseQty = input.newBaseQtyPerPack;
+    variant.currentConversionVersion = nextVersion;
+    if (input.newDefaultSalePriceMinor !== undefined) {
+      variant.defaultSalePriceMinor = input.newDefaultSalePriceMinor;
+    }
+    variant.updatedAt = now;
+
+    addMemAuditEvent({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'pharmacy.uom_conversion_versioned',
+      entityType: 'pack_variant',
+      entityId: variant.id,
+      correlationId,
+      metadataJson: {
+        previousVersion: prevVersion,
+        previousBaseQty: prevQty,
+        newVersion: nextVersion,
+        newBaseQty: input.newBaseQtyPerPack,
+      },
+    });
+
+    return { variant, conversion: newConversion };
+  }
 
   return db.transaction(async (tx) => {
     const [variant] = await tx
@@ -407,7 +709,6 @@ export async function updatePackConversion(
 
     const nextVersion = variant.currentConversionVersion + 1;
 
-    // Append immutable conversion version; never rewrite historical conversion rows (P03)
     const [newConversion] = await tx
       .insert(uomConversions)
       .values({
@@ -469,8 +770,60 @@ export async function addBarcodeAlias(
 ) {
   assertCapability(context, 'pharmacy.catalogue');
   assertPermission(context, 'pharmacy.catalogue.write');
+  await assertWorkspaceNotReadOnlyGrace(context.tenantId, context.timezone);
 
   const trimmedBarcode = input.barcode.trim();
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const variant = store.packVariants.find(
+      (v) =>
+        v.id === input.packVariantId &&
+        v.productId === productId &&
+        v.tenantId === context.tenantId
+    );
+    if (!variant) throw new NotFoundError('Pack variant not found for product');
+
+    const samePair = store.barcodeAliases.some(
+      (b) =>
+        b.tenantId === context.tenantId &&
+        b.packVariantId === variant.id &&
+        b.barcode === trimmedBarcode
+    );
+    if (samePair) throw new ConflictError('This barcode is already registered on this pack variant');
+
+    const hasConflict = store.barcodeAliases.some(
+      (b) =>
+        b.tenantId === context.tenantId &&
+        b.barcode === trimmedBarcode &&
+        b.packVariantId !== variant.id
+    );
+
+    const alias = {
+      id: crypto.randomUUID(),
+      tenantId: context.tenantId,
+      productId,
+      packVariantId: variant.id,
+      barcode: trimmedBarcode,
+      barcodeType: input.barcodeType,
+      status: (hasConflict ? 'conflict_review' : 'active') as 'conflict_review' | 'active',
+      createdAt: new Date(),
+    };
+    store.barcodeAliases.push(alias);
+
+    addMemAuditEvent({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'pharmacy.barcode_alias_added',
+      entityType: 'barcode_alias',
+      entityId: alias.id,
+      correlationId,
+      metadataJson: { barcode: trimmedBarcode, productId, packVariantId: variant.id, hasConflict },
+    });
+
+    return { alias, conflictDetected: hasConflict };
+  }
 
   const [variant] = await db
     .select()

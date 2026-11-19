@@ -1,5 +1,6 @@
+import crypto from 'node:crypto';
 import { and, desc, eq, gt, isNull, or } from 'drizzle-orm';
-import { db } from '../db/index.ts';
+import { db, isDatabaseConfigured } from '../db/index.ts';
 import {
   auditEvents,
   legalEntities,
@@ -14,12 +15,14 @@ import type {
   ProductMode,
   ProfessionalGrantType,
 } from '../contracts/api.ts';
+import { getMemoryUserById } from '../db/users.ts';
 import {
   ConflictError,
   ForbiddenError,
   NotFoundError,
   ValidationError,
 } from './errors.ts';
+import { addMemAuditEvent, getMemoryStore } from './memory-store.ts';
 import { assertPermission, type ActiveWorkspaceContext } from './tenancy.ts';
 
 export const MANDATORY_SAFETY_CAPABILITIES: readonly CapabilityKey[] = [
@@ -40,6 +43,9 @@ export const PRODUCT_MODE_CAPABILITIES: Record<ProductMode, readonly CapabilityK
     'appointments.manage',
     'attendance.manage',
     'collections.record',
+    'accounts.ledger',
+    'hr.management',
+    'admin.operations',
     ...SHARED_STANDARD_CAPABILITIES,
     ...MANDATORY_SAFETY_CAPABILITIES,
   ],
@@ -47,17 +53,24 @@ export const PRODUCT_MODE_CAPABILITIES: Record<ProductMode, readonly CapabilityK
     'pharmacy.catalogue',
     'pharmacy.receiving',
     'pharmacy.inventory',
+    'accounts.ledger',
+    'purchasing.orders',
+    'hr.management',
+    'admin.operations',
     ...SHARED_STANDARD_CAPABILITIES,
     ...MANDATORY_SAFETY_CAPABILITIES,
   ],
   pharmacy_retail_only: [
-    // Dependency closure automatically enables catalogue + receiving + inventory
     'pharmacy.catalogue',
     'pharmacy.receiving',
     'pharmacy.inventory',
     'pharmacy.pos',
     'pharmacy.returns',
     'pharmacy.professional_gate',
+    'accounts.ledger',
+    'purchasing.orders',
+    'hr.management',
+    'admin.operations',
     ...SHARED_STANDARD_CAPABILITIES,
     ...MANDATORY_SAFETY_CAPABILITIES,
   ],
@@ -71,6 +84,10 @@ export const PRODUCT_MODE_CAPABILITIES: Record<ProductMode, readonly CapabilityK
     'pharmacy.pos',
     'pharmacy.returns',
     'pharmacy.professional_gate',
+    'accounts.ledger',
+    'purchasing.orders',
+    'hr.management',
+    'admin.operations',
     ...SHARED_STANDARD_CAPABILITIES,
     ...MANDATORY_SAFETY_CAPABILITIES,
   ],
@@ -90,6 +107,10 @@ export const ALL_KNOWN_CAPABILITIES: readonly CapabilityKey[] = [
   'assistant.text',
   'assistant.voice',
   'exports.csv',
+  'accounts.ledger',
+  'purchasing.orders',
+  'hr.management',
+  'admin.operations',
   ...MANDATORY_SAFETY_CAPABILITIES,
 ];
 
@@ -117,7 +138,6 @@ export function resolveCapabilitiesForMode(
       }
       if ((ALL_KNOWN_CAPABILITIES as readonly string[]).includes(key)) {
         const typedKey = key as CapabilityKey;
-        // Dependency closure: pharmacy.pos requires pharmacy.inventory, pharmacy.receiving, pharmacy.catalogue
         if (typedKey === 'pharmacy.pos' && desired === true) {
           result['pharmacy.catalogue'] = true;
           result['pharmacy.receiving'] = true;
@@ -141,7 +161,6 @@ export function resolveCapabilitiesForMode(
     }
   }
 
-  // Re-assert mandatory safety controls unconditionally
   for (const safetyCap of MANDATORY_SAFETY_CAPABILITIES) {
     result[safetyCap] = true;
   }
@@ -156,6 +175,47 @@ export async function updateTenantProductMode(
 ) {
   assertPermission(context, 'platform.capabilities.manage');
   const resolved = resolveCapabilitiesForMode(input.productMode, input.extraCapabilities);
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const tenant = store.tenants.find((t) => t.id === context.tenantId);
+    if (tenant) {
+      tenant.productMode = input.productMode;
+      tenant.updatedAt = new Date();
+    }
+    const now = new Date();
+    for (const [capabilityKey, enabled] of Object.entries(resolved)) {
+      const existing = store.capabilities.find(
+        (c) => c.tenantId === context.tenantId && c.capabilityKey === capabilityKey
+      );
+      if (existing) {
+        existing.enabled = enabled;
+        existing.planTier = input.productMode;
+        existing.updatedAt = now;
+      } else {
+        store.capabilities.push({
+          tenantId: context.tenantId,
+          capabilityKey,
+          enabled,
+          planTier: input.productMode,
+          quotaLimit: capabilityKey === 'assistant.voice' ? 250 : null,
+          updatedAt: now,
+        });
+      }
+    }
+    addMemAuditEvent({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'platform.product_mode_updated',
+      entityType: 'tenant',
+      entityId: context.tenantId,
+      inputSource: 'ui',
+      correlationId,
+      metadataJson: { previousMode: context.productMode, newMode: input.productMode },
+    });
+    return { productMode: input.productMode, capabilities: resolved };
+  }
 
   await db.transaction(async (tx) => {
     await tx
@@ -174,7 +234,7 @@ export async function updateTenantProductMode(
           capabilityKey,
           enabled,
           planTier: input.productMode,
-          quotaLimit: capabilityKey === 'assistant.voice' ? 120 : null,
+          quotaLimit: capabilityKey === 'assistant.voice' ? 250 : null,
           updatedAt: new Date(),
         })
         .onConflictDoUpdate({
@@ -209,15 +269,32 @@ export async function updateTenantProductMode(
   };
 }
 
-/**
- * Verifies an active, unrevoked, unexpired professional grant in PostgreSQL.
- * Holding `owner` or `manager` membership NEVER satisfies a professional grant.
- */
 export async function assertProfessionalGrant(
   context: ActiveWorkspaceContext,
   grantType: ProfessionalGrantType
 ) {
   const now = new Date();
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const grant = store.professionalGrants.find(
+      (g) =>
+        g.tenantId === context.tenantId &&
+        g.userId === context.userId &&
+        g.grantType === grantType &&
+        g.active &&
+        !g.revokedAt &&
+        (!g.expiresAt || g.expiresAt.getTime() > now.getTime())
+    );
+    if (!grant) {
+      throw new ForbiddenError(
+        `An active ${grantType} professional grant is required for this regulated operation (admin/owner role alone is insufficient)`,
+        'PROFESSIONAL_GRANT_REQUIRED',
+        'errors.professional_grant_required'
+      );
+    }
+    return grant;
+  }
+
   const [grant] = await db
     .select({
       id: professionalGrants.id,
@@ -251,6 +328,29 @@ export async function assertProfessionalGrant(
 
 export async function listProfessionalGrants(context: ActiveWorkspaceContext) {
   assertPermission(context, 'pharmacy.stock.read');
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    return store.professionalGrants
+      .filter((g) => g.tenantId === context.tenantId)
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+      .map((g) => {
+        const u = getMemoryUserById(g.userId);
+        return {
+          id: g.id,
+          userId: g.userId,
+          userEmail: u?.email ?? 'staff@suwaseva.lk',
+          userName: u?.displayName ?? 'Workspace Staff',
+          grantType: g.grantType,
+          licenseNumber: g.licenseNumber,
+          active: g.active,
+          revokedAt: g.revokedAt,
+          expiresAt: g.expiresAt,
+          createdAt: g.createdAt,
+        };
+      });
+  }
+
   const rows = await db
     .select({
       id: professionalGrants.id,
@@ -283,6 +383,63 @@ export async function grantProfessionalAuthority(
   correlationId: string
 ) {
   assertPermission(context, 'platform.grants.manage');
+  const parsedExpires = input.expiresAt ? new Date(input.expiresAt) : null;
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const member = store.memberships.find(
+      (m) => m.tenantId === context.tenantId && m.userId === input.userId && m.active
+    );
+    if (!member) {
+      throw new NotFoundError('Target staff member does not have an active membership in this workspace');
+    }
+    const existing = store.professionalGrants.find(
+      (g) =>
+        g.tenantId === context.tenantId &&
+        g.userId === input.userId &&
+        g.grantType === input.grantType &&
+        g.active &&
+        !g.revokedAt
+    );
+    if (existing) {
+      throw new ConflictError(
+        `User already holds an active ${input.grantType} grant in this workspace`,
+        'GRANT_ALREADY_ACTIVE'
+      );
+    }
+    const now = new Date();
+    const grant = {
+      id: crypto.randomUUID(),
+      tenantId: context.tenantId,
+      branchId: context.branchId,
+      userId: input.userId,
+      grantType: input.grantType,
+      licenseNumber: input.licenseNumber.trim(),
+      active: true,
+      grantedByUserId: context.userId,
+      revokedAt: null,
+      expiresAt: parsedExpires,
+      createdAt: now,
+      updatedAt: now,
+    };
+    store.professionalGrants.push(grant);
+    addMemAuditEvent({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'platform.professional_grant_issued',
+      entityType: 'professional_grant',
+      entityId: grant.id,
+      inputSource: 'ui',
+      correlationId,
+      metadataJson: {
+        targetUserId: input.userId,
+        grantType: input.grantType,
+        licenseNumber: grant.licenseNumber,
+      },
+    });
+    return grant;
+  }
 
   const [member] = await db
     .select({ id: memberships.id })
@@ -320,8 +477,6 @@ export async function grantProfessionalAuthority(
       'GRANT_ALREADY_ACTIVE'
     );
   }
-
-  const parsedExpires = input.expiresAt ? new Date(input.expiresAt) : null;
 
   const [created] = await db.transaction(async (tx) => {
     const [grant] = await tx
@@ -367,6 +522,29 @@ export async function revokeProfessionalAuthority(
 ) {
   assertPermission(context, 'platform.grants.manage');
 
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const row = store.professionalGrants.find(
+      (g) => g.id === grantId && g.tenantId === context.tenantId && g.active
+    );
+    if (!row) throw new NotFoundError('Active professional grant not found');
+    row.active = false;
+    row.revokedAt = new Date();
+    row.updatedAt = new Date();
+    addMemAuditEvent({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'platform.professional_grant_revoked',
+      entityType: 'professional_grant',
+      entityId: row.id,
+      inputSource: 'ui',
+      correlationId,
+      metadataJson: { targetUserId: row.userId, grantType: row.grantType },
+    });
+    return row;
+  }
+
   const [updated] = await db.transaction(async (tx) => {
     const [row] = await tx
       .update(professionalGrants)
@@ -410,6 +588,10 @@ export async function revokeProfessionalAuthority(
 }
 
 export async function listLegalEntities(context: ActiveWorkspaceContext) {
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    return store.legalEntities.filter((l) => l.tenantId === context.tenantId && l.active);
+  }
   return db
     .select()
     .from(legalEntities)
@@ -422,6 +604,34 @@ export async function createLegalEntity(
   correlationId: string
 ) {
   assertPermission(context, 'platform.capabilities.manage');
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const created = {
+      id: crypto.randomUUID(),
+      tenantId: context.tenantId,
+      name: input.name.trim(),
+      registrationNumber: input.registrationNumber?.trim() || '',
+      taxId: input.taxId?.trim() || '',
+      countryCode: context.countryCode,
+      currency: context.currency,
+      active: true,
+      createdAt: new Date(),
+    };
+    store.legalEntities.push(created);
+    addMemAuditEvent({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'platform.legal_entity_created',
+      entityType: 'legal_entity',
+      entityId: created.id,
+      inputSource: 'ui',
+      correlationId,
+      metadataJson: { name: created.name },
+    });
+    return created;
+  }
+
   return db.transaction(async (tx) => {
     const [created] = await tx
       .insert(legalEntities)

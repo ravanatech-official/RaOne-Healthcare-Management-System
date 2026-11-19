@@ -1742,3 +1742,628 @@ export const posReturnLines = pgTable(
     check('pos_ret_lines_refund_nonneg_chk', sql`${table.refundMinor} >= 0`),
   ]
 );
+
+// 47. SaaS Tenant Subscriptions (Plan, Billing Cycle & Saved Payment Method Metadata)
+export const tenantSubscriptions = pgTable(
+  'tenant_subscriptions',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    tenantId: uuid('tenant_id')
+      .notNull()
+      .references(() => tenants.id, { onDelete: 'cascade' }),
+    planCode: text('plan_code').notNull().default('combo'), // clinic_only | pharmacy_inventory_only | pharmacy_retail_only | combo
+    billingCycle: text('billing_cycle').notNull().default('monthly'), // monthly | annual
+    status: text('status').notNull().default('active'), // trialing | active | past_due | suspended | cancelled
+    monthlyAmountMinor: integer('monthly_amount_minor').notNull().default(1250000),
+    currency: text('currency').notNull().default('LKR'),
+    currentPeriodStart: text('current_period_start').notNull(),
+    currentPeriodEnd: text('current_period_end').notNull(),
+    nextBillingDate: text('next_billing_date').notNull(),
+    autoRenew: boolean('auto_renew').notNull().default(true),
+    paymentMethodType: text('payment_method_type').notNull().default('none'), // card | lankaqr | bank_transfer | none
+    paymentMethodLabel: text('payment_method_label').notNull().default(''),
+    gatewayProvider: text('gateway_provider').notNull().default('payhere'),
+    recurringToken: text('recurring_token').notNull().default(''),
+    trialEndsAt: text('trial_ends_at').notNull().default(''),
+    graceEndsAt: text('grace_ends_at').notNull().default(''),
+    lastWebhookAt: timestamp('last_webhook_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('tenant_subscriptions_tenant_uidx').on(table.tenantId),
+    unique('tenant_subscriptions_tenant_id_id_uniq').on(table.tenantId, table.id),
+    check(
+      'tenant_subscriptions_cycle_chk',
+      sql`${table.billingCycle} IN ('monthly', 'annual')`
+    ),
+    check(
+      'tenant_subscriptions_status_chk',
+      sql`${table.status} IN ('trialing', 'active', 'past_due', 'suspended', 'cancelled')`
+    ),
+  ]
+);
+
+// 48. SaaS Subscription Invoices (Monthly / Annual LKR Tax Invoices)
+export const subscriptionInvoices = pgTable(
+  'subscription_invoices',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    tenantId: uuid('tenant_id')
+      .notNull()
+      .references(() => tenants.id, { onDelete: 'cascade' }),
+    subscriptionId: uuid('subscription_id').notNull(),
+    invoiceNumber: text('invoice_number').notNull(),
+    planCode: text('plan_code').notNull(),
+    billingCycle: text('billing_cycle').notNull().default('monthly'),
+    description: text('description').notNull(),
+    billingPeriodStart: text('billing_period_start').notNull(),
+    billingPeriodEnd: text('billing_period_end').notNull(),
+    dueDate: text('due_date').notNull(),
+    subtotalMinor: integer('subtotal_minor').notNull(),
+    discountMinor: integer('discount_minor').notNull().default(0),
+    totalMinor: integer('total_minor').notNull(),
+    paidMinor: integer('paid_minor').notNull().default(0),
+    currency: text('currency').notNull().default('LKR'),
+    status: text('status').notNull().default('open'), // open | paid | past_due | void
+    issuedAt: timestamp('issued_at', { withTimezone: true }).defaultNow().notNull(),
+    paidAt: timestamp('paid_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    unique('subscription_invoices_tenant_id_id_uniq').on(table.tenantId, table.id),
+    uniqueIndex('subscription_invoices_tenant_number_uidx').on(table.tenantId, table.invoiceNumber),
+    foreignKey({
+      columns: [table.tenantId, table.subscriptionId],
+      foreignColumns: [tenantSubscriptions.tenantId, tenantSubscriptions.id],
+      name: 'sub_invoices_subscription_fk',
+    }),
+    check('sub_invoices_total_nonneg_chk', sql`${table.totalMinor} >= 0`),
+    check('sub_invoices_paid_nonneg_chk', sql`${table.paidMinor} >= 0`),
+    check(
+      'sub_invoices_status_chk',
+      sql`${table.status} IN ('open', 'paid', 'past_due', 'void')`
+    ),
+  ]
+);
+
+// 49. SaaS Subscription Payments (Idempotent Card / LankaQR / Bank Transfer Settlements)
+export const subscriptionPayments = pgTable(
+  'subscription_payments',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    tenantId: uuid('tenant_id')
+      .notNull()
+      .references(() => tenants.id, { onDelete: 'cascade' }),
+    invoiceId: uuid('invoice_id').notNull(),
+    idempotencyKey: text('idempotency_key').notNull(),
+    amountMinor: integer('amount_minor').notNull(),
+    currency: text('currency').notNull().default('LKR'),
+    method: text('method').notNull(), // card | lankaqr | bank_transfer
+    gatewayProvider: text('gateway_provider').notNull(),
+    gatewayReference: text('gateway_reference').notNull(),
+    cardBrand: text('card_brand').notNull().default(''),
+    cardLast4: text('card_last4').notNull().default(''),
+    bankName: text('bank_name').notNull().default(''),
+    bankReference: text('bank_reference').notNull().default(''),
+    status: text('status').notNull().default('succeeded'), // succeeded | pending_verification | failed
+    receiptNumber: text('receipt_number').notNull(),
+    paidByUserId: integer('paid_by_user_id')
+      .notNull()
+      .references(() => users.id),
+    paidAt: timestamp('paid_at', { withTimezone: true }).defaultNow().notNull(),
+    metadataJson: jsonb('metadata_json').notNull().default({}),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('subscription_payments_tenant_idem_uidx').on(table.tenantId, table.idempotencyKey),
+    uniqueIndex('subscription_payments_tenant_receipt_uidx').on(table.tenantId, table.receiptNumber),
+    foreignKey({
+      columns: [table.tenantId, table.invoiceId],
+      foreignColumns: [subscriptionInvoices.tenantId, subscriptionInvoices.id],
+      name: 'sub_payments_invoice_fk',
+    }),
+    check('sub_payments_amount_pos_chk', sql`${table.amountMinor} > 0`),
+    check(
+      'sub_payments_method_chk',
+      sql`${table.method} IN ('card', 'lankaqr', 'bank_transfer')`
+    ),
+    check(
+      'sub_payments_status_chk',
+      sql`${table.status} IN ('succeeded', 'pending_verification', 'failed')`
+    ),
+  ]
+);
+
+// 50. Doctor Session Templates (Weekly channeling windows)
+export const doctorSchedules = pgTable('doctor_schedules', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  branchId: uuid('branch_id').notNull(),
+  resourceId: uuid('resource_id').notNull(),
+  dayOfWeek: integer('day_of_week').notNull(), // 0 (Sun) - 6 (Sat)
+  startTime: text('start_time').notNull(), // HH:mm
+  endTime: text('end_time').notNull(), // HH:mm
+  slotDurationMinutes: integer('slot_duration_minutes').notNull().default(20),
+  active: boolean('active').notNull().default(true),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// 51. Doctor Holiday / Leave Blocks
+export const doctorHolidayBlocks = pgTable('doctor_holiday_blocks', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  branchId: uuid('branch_id').notNull(),
+  resourceId: uuid('resource_id').notNull(),
+  blockDate: text('block_date').notNull(), // YYYY-MM-DD
+  reason: text('reason').notNull().default('Doctor Leave'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// 52. Doctor Channeling Commission Rules
+export const doctorCommissionRules = pgTable('doctor_commission_rules', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  resourceId: uuid('resource_id').notNull(),
+  serviceId: uuid('service_id'),
+  doctorSharePercent: integer('doctor_share_percent').notNull().default(75),
+  clinicSharePercent: integer('clinic_share_percent').notNull().default(25),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// 53. Appointment Token Queue & Waiting Room State
+export const appointmentQueueTokens = pgTable('appointment_queue_tokens', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  branchId: uuid('branch_id').notNull(),
+  businessDate: text('business_date').notNull(),
+  appointmentId: uuid('appointment_id').notNull(),
+  resourceId: uuid('resource_id').notNull(),
+  tokenNumber: integer('token_number').notNull(),
+  queueState: text('queue_state').notNull().default('waiting'), // waiting | serving | completed | skipped
+  delayMinutes: integer('delay_minutes').notNull().default(0),
+  calledAt: timestamp('called_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// 54. WhatsApp & SMS Notification Dispatches
+export const notificationDispatches = pgTable('notification_dispatches', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  branchId: uuid('branch_id').notNull(),
+  channel: text('channel').notNull(), // whatsapp | sms
+  provider: text('provider').notNull(), // whatsapp_cloud | notify_lk | dialog_sms | mobitel_sms
+  templateType: text('template_type').notNull(), // invoice_due | payment_receipt | appointment_reminder | queue_token | doctor_delay
+  recipientPhone: text('recipient_phone').notNull(),
+  recipientName: text('recipient_name').notNull().default(''),
+  messageBody: text('message_body').notNull(),
+  status: text('status').notNull().default('sent'), // sent | queued | delivered | failed
+  entityType: text('entity_type').notNull().default(''),
+  entityId: text('entity_id').notNull().default(''),
+  externalRef: text('external_ref').notNull().default(''),
+  sentAt: timestamp('sent_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// 55. Physical Stocktakes
+export const stocktakes = pgTable('stocktakes', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  branchId: uuid('branch_id').notNull(),
+  stocktakeNumber: text('stocktake_number').notNull(),
+  notes: text('notes').notNull().default(''),
+  status: text('status').notNull().default('open'), // open | reconciled
+  createdByUserId: integer('created_by_user_id').references(() => users.id),
+  reconciledByUserId: integer('reconciled_by_user_id').references(() => users.id),
+  reconciledAt: timestamp('reconciled_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// 56. Physical Stocktake Lines
+export const stocktakeLines = pgTable('stocktake_lines', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  stocktakeId: uuid('stocktake_id').notNull(),
+  productId: uuid('product_id').notNull(),
+  lotId: uuid('lot_id').notNull(),
+  locationId: uuid('location_id').notNull(),
+  systemQtyBase: integer('system_qty_base').notNull(),
+  countedQtyBase: integer('counted_qty_base').notNull(),
+  varianceQtyBase: integer('variance_qty_base').notNull(),
+  reason: text('reason').notNull().default(''),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// 57. Multi-Branch Stock Transfers
+export const stockTransfers = pgTable('stock_transfers', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  transferNumber: text('transfer_number').notNull(),
+  fromBranchId: uuid('from_branch_id').notNull(),
+  toBranchId: uuid('to_branch_id').notNull(),
+  status: text('status').notNull().default('dispatched'), // dispatched | received
+  notes: text('notes').notNull().default(''),
+  dispatchedByUserId: integer('dispatched_by_user_id').references(() => users.id),
+  receivedByUserId: integer('received_by_user_id').references(() => users.id),
+  dispatchedAt: timestamp('dispatched_at', { withTimezone: true }).defaultNow().notNull(),
+  receivedAt: timestamp('received_at', { withTimezone: true }),
+});
+
+// 58. Multi-Branch Stock Transfer Lines
+export const stockTransferLines = pgTable('stock_transfer_lines', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  transferId: uuid('transfer_id').notNull(),
+  productId: uuid('product_id').notNull(),
+  lotId: uuid('lot_id').notNull(),
+  qtyBase: integer('qty_base').notNull(),
+  receivedIntoQuarantine: boolean('received_into_quarantine').notNull().default(true),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// 59. Clinical Bridge: Doctor Consultation -> Pharmacy Dispense Queue
+export const dispenseOrders = pgTable('dispense_orders', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  branchId: uuid('branch_id').notNull(),
+  orderNumber: text('order_number').notNull(),
+  personId: uuid('person_id').notNull(),
+  appointmentId: uuid('appointment_id'),
+  prescriberName: text('prescriber_name').notNull(),
+  clinicalNotes: text('clinical_notes').notNull().default(''),
+  status: text('status').notNull().default('pending'), // pending | dispensed | cancelled
+  posSaleId: uuid('pos_sale_id'),
+  createdByUserId: integer('created_by_user_id').references(() => users.id),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  dispensedAt: timestamp('dispensed_at', { withTimezone: true }),
+});
+
+// 60. Clinical Dispense Order Lines
+export const dispenseOrderLines = pgTable('dispense_order_lines', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  dispenseOrderId: uuid('dispense_order_id').notNull(),
+  productId: uuid('product_id').notNull(),
+  packVariantId: uuid('pack_variant_id').notNull(),
+  qtyPacks: integer('qty_packs').notNull().default(1),
+  dosageInstruction: text('dosage_instruction').notNull().default(''),
+});
+
+// 61. Staff Invites
+export const staffInvites = pgTable('staff_invites', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  branchId: uuid('branch_id').notNull(),
+  email: text('email').notNull(),
+  displayName: text('display_name').notNull().default(''),
+  role: text('role').notNull(),
+  inviteToken: text('invite_token').notNull(),
+  status: text('status').notNull().default('pending'), // pending | accepted | revoked
+  invitedByUserId: integer('invited_by_user_id').references(() => users.id),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// 62. Quick Shift Lock Screen PINs
+export const staffShiftPins = pgTable('staff_shift_pins', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  userId: integer('user_id')
+    .notNull()
+    .references(() => users.id, { onDelete: 'cascade' }),
+  branchId: uuid('branch_id').notNull(),
+  pinSalt: text('pin_salt').notNull(),
+  pinHash: text('pin_hash').notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// 63. Monthly Quota Metering Usage
+export const workspaceQuotaUsage = pgTable('workspace_quota_usage', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  periodMonth: text('period_month').notNull(), // YYYY-MM
+  aiVoiceTurnsUsed: integer('ai_voice_turns_used').notNull().default(0),
+  whatsappSentCount: integer('whatsapp_sent_count').notNull().default(0),
+  smsSentCount: integer('sms_sent_count').notNull().default(0),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// 64. Accounts Department: Daily Operating Expenses (OpEx & Petty Cash)
+export const operatingExpenses = pgTable('operating_expenses', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  branchId: uuid('branch_id').notNull(),
+  expenseDate: text('expense_date').notNull(), // YYYY-MM-DD
+  category: text('category').notNull(), // rent | utilities | salaries | maintenance | supplies | courier | petty_cash | other
+  description: text('description').notNull(),
+  amountMinor: integer('amount_minor').notNull(),
+  paymentMethod: text('payment_method').notNull().default('cash'),
+  referenceNo: text('reference_no').notNull().default(''),
+  status: text('status').notNull().default('posted'), // posted | voided
+  recordedByUserId: integer('recorded_by_user_id').references(() => users.id),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// 65. Accounts Department: Customer/Patient/Corporate Receivable Credit Accounts (AR)
+export const creditAccounts = pgTable('credit_accounts', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  branchId: uuid('branch_id').notNull(),
+  personId: uuid('person_id'),
+  accountName: text('account_name').notNull(),
+  accountType: text('account_type').notNull().default('customer'), // patient | corporate | customer
+  phone: text('phone').notNull().default(''),
+  creditLimitMinor: integer('credit_limit_minor').notNull().default(5000000),
+  balanceMinor: integer('balance_minor').notNull().default(0),
+  lastTransactionAt: timestamp('last_transaction_at', { withTimezone: true }).defaultNow().notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// 66. Accounts Department: Receivable Ledger Entries (Charges & Repayments w/ Due Date Aging)
+export const creditEntries = pgTable('credit_entries', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  branchId: uuid('branch_id').notNull(),
+  creditAccountId: uuid('credit_account_id').notNull(),
+  entryType: text('entry_type').notNull(), // charge | payment
+  amountMinor: integer('amount_minor').notNull(),
+  method: text('method').notNull().default('cash'),
+  referenceNo: text('reference_no').notNull().default(''),
+  dueDate: text('due_date').notNull(),
+  notes: text('notes').notNull().default(''),
+  recordedByUserId: integer('recorded_by_user_id').references(() => users.id),
+  occurredAt: timestamp('occurred_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// 67. Accounts Department: Supplier Payables Settlement Payments (AP)
+export const supplierPayments = pgTable('supplier_payments', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  branchId: uuid('branch_id').notNull(),
+  supplierId: uuid('supplier_id').notNull(),
+  supplierInvoiceId: uuid('supplier_invoice_id'),
+  amountMinor: integer('amount_minor').notNull(),
+  method: text('method').notNull().default('bank'), // cash | cheque | bank
+  referenceNo: text('reference_no').notNull().default(''),
+  paidDate: text('paid_date').notNull(),
+  notes: text('notes').notNull().default(''),
+  recordedByUserId: integer('recorded_by_user_id').references(() => users.id),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// 68. Purchasing Department: Purchase Orders (PO -> Approval -> GRN)
+export const purchaseOrders = pgTable('purchase_orders', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  branchId: uuid('branch_id').notNull(),
+  supplierId: uuid('supplier_id').notNull(),
+  poNumber: text('po_number').notNull(),
+  status: text('status').notNull().default('draft'), // draft | approved | received | cancelled
+  expectedDate: text('expected_date').notNull(),
+  notes: text('notes').notNull().default(''),
+  totalEstimatedMinor: integer('total_estimated_minor').notNull().default(0),
+  approvedByUserId: integer('approved_by_user_id').references(() => users.id),
+  approvedAt: timestamp('approved_at', { withTimezone: true }),
+  convertedGrnId: uuid('converted_grn_id'),
+  createdByUserId: integer('created_by_user_id').references(() => users.id),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// 69. Purchasing Department: Purchase Order Lines
+export const purchaseOrderLines = pgTable('purchase_order_lines', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  purchaseOrderId: uuid('purchase_order_id').notNull(),
+  productId: uuid('product_id').notNull(),
+  packVariantId: uuid('pack_variant_id').notNull(),
+  orderedPacks: integer('ordered_packs').notNull(),
+  estimatedUnitPackCostMinor: integer('estimated_unit_pack_cost_minor').notNull().default(0),
+});
+
+// 70. Purchasing Department: Supplier Return / Debit Notes
+export const supplierDebitNotes = pgTable('supplier_debit_notes', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  branchId: uuid('branch_id').notNull(),
+  supplierId: uuid('supplier_id').notNull(),
+  debitNoteNumber: text('debit_note_number').notNull(),
+  reason: text('reason').notNull(), // near_expiry | damaged | overcharged | dead_stock
+  amountMinor: integer('amount_minor').notNull(),
+  productId: uuid('product_id').notNull(),
+  lotId: uuid('lot_id').notNull(),
+  qtyBase: integer('qty_base').notNull(),
+  status: text('status').notNull().default('applied'),
+  notes: text('notes').notNull().default(''),
+  createdByUserId: integer('created_by_user_id').references(() => users.id),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// 71. HR Department: Staff Compensation & EPF/ETF Profiles
+export const hrStaffProfiles = pgTable('hr_staff_profiles', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  userId: integer('user_id')
+    .notNull()
+    .references(() => users.id, { onDelete: 'cascade' }),
+  designation: text('designation').notNull().default('Staff Member'),
+  basicSalaryMinor: integer('basic_salary_minor').notNull().default(4500000),
+  allowancesMinor: integer('allowances_minor').notNull().default(500000),
+  epfApplicable: boolean('epf_applicable').notNull().default(true),
+  etfApplicable: boolean('etf_applicable').notNull().default(true),
+  bankName: text('bank_name').notNull().default(''),
+  bankAccountNo: text('bank_account_no').notNull().default(''),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// 72. HR Department: Staff Attendance Clock-In / Clock-Out Logs
+export const hrAttendanceLogs = pgTable('hr_attendance_logs', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  branchId: uuid('branch_id').notNull(),
+  userId: integer('user_id')
+    .notNull()
+    .references(() => users.id, { onDelete: 'cascade' }),
+  businessDate: text('business_date').notNull(),
+  clockInAt: timestamp('clock_in_at', { withTimezone: true }).defaultNow().notNull(),
+  clockOutAt: timestamp('clock_out_at', { withTimezone: true }),
+  lateMinutes: integer('late_minutes').notNull().default(0),
+  overtimeMinutes: integer('overtime_minutes').notNull().default(0),
+  status: text('status').notNull().default('present'), // present | completed
+  notes: text('notes').notNull().default(''),
+});
+
+// 73. HR Department: Staff Leave Requests & Approvals
+export const hrLeaveRequests = pgTable('hr_leave_requests', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  branchId: uuid('branch_id').notNull(),
+  userId: integer('user_id')
+    .notNull()
+    .references(() => users.id, { onDelete: 'cascade' }),
+  leaveType: text('leave_type').notNull(), // annual | casual | medical | no_pay
+  startDate: text('start_date').notNull(),
+  endDate: text('end_date').notNull(),
+  daysCount: integer('days_count').notNull().default(1),
+  reason: text('reason').notNull(),
+  status: text('status').notNull().default('pending'), // pending | approved | rejected
+  reviewedByUserId: integer('reviewed_by_user_id').references(() => users.id),
+  reviewedAt: timestamp('reviewed_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// 74. HR Department: Monthly Payroll Runs & Individual Slips (EPF 8%/12%, ETF 3%)
+export const hrPayrollRuns = pgTable('hr_payroll_runs', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  payrollMonth: text('payroll_month').notNull(), // YYYY-MM
+  status: text('status').notNull().default('draft'), // draft | finalized
+  totalGrossMinor: integer('total_gross_minor').notNull().default(0),
+  totalNetMinor: integer('total_net_minor').notNull().default(0),
+  totalEmployerEpfMinor: integer('total_employer_epf_minor').notNull().default(0),
+  totalEtfMinor: integer('total_etf_minor').notNull().default(0),
+  finalizedAt: timestamp('finalized_at', { withTimezone: true }),
+  createdByUserId: integer('created_by_user_id').references(() => users.id),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const hrPayrollSlips = pgTable('hr_payroll_slips', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  payrollRunId: uuid('payroll_run_id').notNull(),
+  userId: integer('user_id').notNull(),
+  staffName: text('staff_name').notNull(),
+  designation: text('designation').notNull(),
+  basicMinor: integer('basic_minor').notNull(),
+  allowancesMinor: integer('allowances_minor').notNull(),
+  overtimeMinor: integer('overtime_minor').notNull().default(0),
+  commissionMinor: integer('commission_minor').notNull().default(0),
+  noPayDeductionMinor: integer('no_pay_deduction_minor').notNull().default(0),
+  epfEmployee8Minor: integer('epf_employee_8_minor').notNull().default(0),
+  epfEmployer12Minor: integer('epf_employer_12_minor').notNull().default(0),
+  etfEmployer3Minor: integer('etf_employer_3_minor').notNull().default(0),
+  netPayMinor: integer('net_pay_minor').notNull(),
+});
+
+// 75. Admin & Clinical Ops: Lab / Diagnostic Orders
+export const labDiagnosticOrders = pgTable('lab_diagnostic_orders', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  branchId: uuid('branch_id').notNull(),
+  personId: uuid('person_id').notNull(),
+  appointmentId: uuid('appointment_id'),
+  testName: text('test_name').notNull(),
+  labProvider: text('lab_provider').notNull().default('In-House Lab'),
+  feeMinor: integer('fee_minor').notNull().default(0),
+  status: text('status').notNull().default('ordered'), // ordered | sample_collected | report_ready | cancelled
+  resultSummary: text('result_summary').notNull().default(''),
+  orderedByUserId: integer('ordered_by_user_id').references(() => users.id),
+  orderedAt: timestamp('ordered_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// 76. Admin & Pharmacy Ops: Cold-Chain Fridge Temperature Log
+export const coldChainLogs = pgTable('cold_chain_logs', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  branchId: uuid('branch_id').notNull(),
+  fridgeName: text('fridge_name').notNull(),
+  tempTenthsC: integer('temp_tenths_c').notNull(), // e.g., 42 = 4.2°C
+  inRange: boolean('in_range').notNull().default(true), // 2.0°C - 8.0°C
+  notes: text('notes').notNull().default(''),
+  recordedByUserId: integer('recorded_by_user_id').references(() => users.id),
+  loggedAt: timestamp('logged_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// 77. Admin & Compliance Vault: NMRA / SLMC / BR / PHI License Expiry Alerts
+export const complianceLicenses = pgTable('compliance_licenses', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  branchId: uuid('branch_id').notNull(),
+  title: text('title').notNull(),
+  authority: text('authority').notNull(), // NMRA | SLMC | BR | PHI | OTHER
+  licenseNumber: text('license_number').notNull(),
+  expiresOn: text('expires_on').notNull(), // YYYY-MM-DD
+  alertDaysBefore: integer('alert_days_before').notNull().default(30),
+  notes: text('notes').notNull().default(''),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+
+

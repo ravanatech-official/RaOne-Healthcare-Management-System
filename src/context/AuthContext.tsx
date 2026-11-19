@@ -1,8 +1,17 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
-import { onAuthStateChanged, signInWithPopup, signOut as firebaseSignOut, type User } from 'firebase/auth';
+import {
+  createUserWithEmailAndPassword,
+  onAuthStateChanged,
+  sendPasswordResetEmail,
+  signInWithEmailAndPassword,
+  signInWithPopup,
+  signOut as firebaseSignOut,
+  updateProfile,
+  type User,
+} from 'firebase/auth';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { auth, googleAuthProvider } from '../lib/firebase.ts';
+import { auth, configureAuthPersistence, googleAuthProvider } from '../lib/firebase.ts';
 import { apiClient } from '../lib/api-client.ts';
 import type { SessionContextResponse, SupportedLocale } from '../contracts/api.ts';
 
@@ -14,10 +23,19 @@ interface AuthContextValue {
   session: SessionContextResponse | undefined;
   sessionLoading: boolean;
   sessionError: Error | null;
-  signInWithGoogle: () => Promise<void>;
+  signInWithGoogle: (rememberMe?: boolean) => Promise<void>;
+  signInWithEmail: (email: string, password: string, rememberMe?: boolean) => Promise<void>;
+  signUpWithEmail: (
+    email: string,
+    password: string,
+    displayName: string,
+    rememberMe?: boolean
+  ) => Promise<void>;
+  resetPassword: (email: string) => Promise<void>;
   signOut: () => Promise<void>;
   lockScreen: () => void;
   unlockWithGoogle: () => Promise<void>;
+  unlockWithShiftPin: (pin: string) => Promise<void>;
   switchTenant: (tenantId: string) => void;
   changeLanguage: (locale: SupportedLocale) => Promise<void>;
   refetchSession: () => Promise<unknown>;
@@ -64,9 +82,35 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   }, [session?.user.preferredLocale, i18n]);
 
-  const signInWithGoogle = useCallback(async () => {
+  const signInWithGoogle = useCallback(async (rememberMe = false) => {
+    await configureAuthPersistence(rememberMe);
     await signInWithPopup(auth, googleAuthProvider);
     setIsLocked(false);
+  }, []);
+
+  const signInWithEmail = useCallback(
+    async (email: string, password: string, rememberMe = false) => {
+      await configureAuthPersistence(rememberMe);
+      await signInWithEmailAndPassword(auth, email.trim(), password);
+      setIsLocked(false);
+    },
+    []
+  );
+
+  const signUpWithEmail = useCallback(
+    async (email: string, password: string, displayName: string, rememberMe = false) => {
+      await configureAuthPersistence(rememberMe);
+      const cred = await createUserWithEmailAndPassword(auth, email.trim(), password);
+      if (displayName.trim()) {
+        await updateProfile(cred.user, { displayName: displayName.trim() });
+      }
+      setIsLocked(false);
+    },
+    []
+  );
+
+  const resetPassword = useCallback(async (email: string) => {
+    await sendPasswordResetEmail(auth, email.trim());
   }, []);
 
   const signOut = useCallback(async () => {
@@ -81,6 +125,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     queryClient.removeQueries({ queryKey: ['today'] });
     queryClient.removeQueries({ queryKey: ['team'] });
     queryClient.removeQueries({ queryKey: ['audit'] });
+    queryClient.removeQueries({ queryKey: ['billing-overview'] });
   }, [queryClient]);
 
   const unlockWithGoogle = useCallback(async () => {
@@ -89,12 +134,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     await queryClient.invalidateQueries();
   }, [queryClient]);
 
+  const unlockWithShiftPin = useCallback(
+    async (pin: string) => {
+      const targetTenant = session?.workspace?.tenantId ?? activeTenantId;
+      if (!targetTenant) {
+        throw new Error('No active workspace context for PIN unlock. Please sign in with Google.');
+      }
+      await apiClient.verifyShiftPin(targetTenant, pin);
+      setIsLocked(false);
+      await queryClient.invalidateQueries();
+    },
+    [activeTenantId, queryClient, session?.workspace?.tenantId]
+  );
+
   const switchTenant = useCallback(
     (tenantId: string) => {
-      // Clear previous tenant query cache on switch (v4 §35, SEC-02)
       queryClient.removeQueries({ queryKey: ['today'] });
       queryClient.removeQueries({ queryKey: ['team'] });
       queryClient.removeQueries({ queryKey: ['audit'] });
+      queryClient.removeQueries({ queryKey: ['billing-overview'] });
       setActiveTenantId(tenantId);
     },
     [queryClient]
@@ -121,9 +179,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         sessionLoading,
         sessionError: sessionError as Error | null,
         signInWithGoogle,
+        signInWithEmail,
+        signUpWithEmail,
+        resetPassword,
         signOut,
         lockScreen,
         unlockWithGoogle,
+        unlockWithShiftPin,
         switchTenant,
         changeLanguage,
         refetchSession,
@@ -139,3 +201,4 @@ export function useAuth() {
   if (!ctx) throw new Error('useAuth must be used within AuthProvider');
   return ctx;
 }
+

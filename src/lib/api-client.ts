@@ -1,11 +1,52 @@
 import { auth } from './firebase.ts';
 import type {
   ApiErrorEnvelope,
+  BillingCycle,
+  CreateBranchInput,
+  CreateStaffInviteInput,
+  JarvisConverseInput,
+  JarvisConverseResponse,
+  NotificationDispatchItem,
   OnboardingBootstrapInput,
+  PaySubscriptionInvoiceInput,
+  ProductMode,
+  SendNotificationInput,
   SessionContextResponse,
+  SubscriptionPaymentItem,
   SupportedLocale,
+  TenantSubscriptionOverview,
   TodaySummaryResponse,
+  WorkspaceQuotaSummary,
 } from '../contracts/api.ts';
+import type {
+  CreateDoctorScheduleInput,
+  CreateHolidayBlockInput,
+  DoctorPayoutReportResponse,
+  PatientVisitHistoryResponse,
+  UpsertDoctorCommissionInput,
+  WaitingRoomDisplayResponse,
+} from '../contracts/clinic.ts';
+import type {
+  CombinedZReportResponse,
+  CreateDispenseOrderInput,
+  CreateStockTransferInput,
+  StockAlertsDashboardResponse,
+} from '../contracts/pharmacy.ts';
+import type {
+  AccountsOverviewResponse,
+  ConvertPoToGrnInput,
+  CreateCreditAccountInput,
+  CreateLabOrderInput,
+  CreatePurchaseOrderInput,
+  CreateSupplierDebitNoteInput,
+  HrAdminOverviewResponse,
+  PurchasingOverviewResponse,
+  RecordCreditEntryInput,
+  RecordOperatingExpenseInput,
+  RecordSupplierPaymentInput,
+  RequestLeaveInput,
+  UpsertHrProfileInput,
+} from '../contracts/departments.ts';
 
 export class ApiClientError extends Error {
   public readonly status: number;
@@ -742,6 +783,679 @@ export const apiClient = {
     authorizedFetch<{
       posReturn: { returnNumber: string; refundAmountMinor: number };
     }>(`/pharmacy/pos/sales/${saleId}/returns`, {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  // SaaS Subscription & Monthly Client Billing
+  getBillingOverview: (tenantId: string) =>
+    authorizedFetch<TenantSubscriptionOverview & { correlationId: string }>('/billing/overview', {
+      tenantId,
+    }),
+
+  updateBillingPlan: (
+    tenantId: string,
+    payload: { planCode: ProductMode; billingCycle: BillingCycle; autoRenew?: boolean }
+  ) =>
+    authorizedFetch<TenantSubscriptionOverview & { correlationId: string }>('/billing/plan', {
+      method: 'PATCH',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  generateBillingInvoice: (tenantId: string, payload?: { billingCycle?: BillingCycle }) =>
+    authorizedFetch<TenantSubscriptionOverview & { correlationId: string }>('/billing/invoices', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload ?? {}),
+    }),
+
+  payBillingInvoice: (tenantId: string, payload: PaySubscriptionInvoiceInput) =>
+    authorizedFetch<{
+      overview: TenantSubscriptionOverview;
+      payment: SubscriptionPaymentItem;
+      correlationId: string;
+    }>('/billing/pay', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  confirmBankTransferPayment: (tenantId: string, paymentId: string) =>
+    authorizedFetch<TenantSubscriptionOverview & { correlationId: string }>(
+      `/billing/payments/${paymentId}/confirm`,
+      {
+        method: 'POST',
+        tenantId,
+      }
+    ),
+
+  getBillingQuotas: (tenantId: string) =>
+    authorizedFetch<{ quotas: WorkspaceQuotaSummary; correlationId: string }>('/billing/quotas', {
+      tenantId,
+    }),
+
+  triggerSandboxPayHereWebhook: (
+    tenantId: string,
+    payload: {
+      invoiceId: string;
+      statusCode?: '2' | '-1' | '-2';
+      gatewayProvider?: 'payhere' | 'webxpay' | 'genie';
+    }
+  ) =>
+    authorizedFetch<{
+      processed: boolean;
+      status: string;
+      gatewayReference: string;
+      md5Verified: boolean;
+      overview: TenantSubscriptionOverview;
+      correlationId: string;
+    }>('/billing/webhooks/payhere/sandbox-trigger', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  sendBillingInvoiceReminder: (
+    tenantId: string,
+    payload: {
+      invoiceId: string;
+      recipientPhone: string;
+      channel: 'whatsapp' | 'sms';
+      provider?: 'whatsapp_cloud' | 'notify_lk' | 'dialog_sms' | 'mobitel_sms';
+    }
+  ) =>
+    authorizedFetch<{ dispatch: NotificationDispatchItem; correlationId: string }>(
+      '/billing/notifications/invoice-reminder',
+      {
+        method: 'POST',
+        tenantId,
+        body: JSON.stringify(payload),
+      }
+    ),
+
+  // J.A.R.V.I.S. Conversational Engine & TTS
+  jarvisConverse: (tenantId: string, payload: JarvisConverseInput) =>
+    authorizedFetch<JarvisConverseResponse & { correlationId: string }>('/assistant/converse', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  jarvisTts: (tenantId: string, payload: { text: string; locale: SupportedLocale }) =>
+    authorizedFetch<{
+      mode: 'gemini_audio' | 'browser_tts';
+      mimeType?: string;
+      audioBase64?: string;
+      text: string;
+      locale: SupportedLocale;
+      correlationId: string;
+    }>('/assistant/tts', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  // Notifications
+  getNotifications: (tenantId: string) =>
+    authorizedFetch<{ notifications: NotificationDispatchItem[]; correlationId: string }>(
+      '/notifications',
+      { tenantId }
+    ),
+
+  sendNotification: (tenantId: string, payload: SendNotificationInput) =>
+    authorizedFetch<{ dispatch: NotificationDispatchItem; correlationId: string }>(
+      '/notifications/send',
+      {
+        method: 'POST',
+        tenantId,
+        body: JSON.stringify(payload),
+      }
+    ),
+
+  // Clinic Queue, Schedules, Holidays, Slots, Patient History & Doctor Payouts
+  getWaitingRoomDisplay: (tenantId: string, date?: string) => {
+    const qs = date ? `?date=${encodeURIComponent(date)}` : '';
+    return authorizedFetch<WaitingRoomDisplayResponse & { correlationId: string }>(
+      `/clinic/queue/display${qs}`,
+      { tenantId }
+    );
+  },
+
+  updateAppointmentQueueState: (
+    tenantId: string,
+    appointmentId: string,
+    payload: { queueState: 'waiting' | 'serving' | 'completed' | 'skipped'; delayMinutes?: number }
+  ) =>
+    authorizedFetch(`/clinic/appointments/${appointmentId}/queue`, {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  broadcastDoctorDelay: (
+    tenantId: string,
+    payload: { resourceId: string; delayMinutes: number }
+  ) =>
+    authorizedFetch<{ updatedCount: number; delayMinutes: number; correlationId: string }>(
+      '/clinic/queue/delay-broadcast',
+      {
+        method: 'POST',
+        tenantId,
+        body: JSON.stringify(payload),
+      }
+    ),
+
+  getDoctorSchedules: (tenantId: string, resourceId?: string) => {
+    const qs = resourceId ? `?resourceId=${encodeURIComponent(resourceId)}` : '';
+    return authorizedFetch<{
+      schedules: Array<{
+        id: string;
+        resourceId: string;
+        resourceName: string;
+        dayOfWeek: number;
+        startTime: string;
+        endTime: string;
+        slotDurationMinutes: number;
+      }>;
+      correlationId: string;
+    }>(`/clinic/schedules${qs}`, { tenantId });
+  },
+
+  createDoctorSchedule: (tenantId: string, payload: CreateDoctorScheduleInput) =>
+    authorizedFetch('/clinic/schedules', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  deleteDoctorSchedule: (tenantId: string, id: string) =>
+    authorizedFetch(`/clinic/schedules/${id}`, {
+      method: 'DELETE',
+      tenantId,
+    }),
+
+  getDoctorHolidays: (tenantId: string, resourceId?: string) => {
+    const qs = resourceId ? `?resourceId=${encodeURIComponent(resourceId)}` : '';
+    return authorizedFetch<{
+      holidays: Array<{
+        id: string;
+        resourceId: string;
+        resourceName: string;
+        blockDate: string;
+        reason: string;
+      }>;
+      correlationId: string;
+    }>(`/clinic/holidays${qs}`, { tenantId });
+  },
+
+  createDoctorHoliday: (tenantId: string, payload: CreateHolidayBlockInput) =>
+    authorizedFetch('/clinic/holidays', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  getAvailableDoctorSlots: (tenantId: string, resourceId: string, date: string) =>
+    authorizedFetch<{
+      date: string;
+      isHoliday: boolean;
+      holidayReason?: string;
+      slots: Array<{
+        startsAt: string;
+        label: string;
+        available: boolean;
+      }>;
+      correlationId: string;
+    }>(
+      `/clinic/slots?resourceId=${encodeURIComponent(resourceId)}&date=${encodeURIComponent(date)}`,
+      { tenantId }
+    ),
+
+  getPatientVisitHistory: (tenantId: string, personId: string) =>
+    authorizedFetch<PatientVisitHistoryResponse & { correlationId: string }>(
+      `/clinic/people/${personId}/history`,
+      { tenantId }
+    ),
+
+  getDoctorPayouts: (tenantId: string, date?: string) => {
+    const qs = date ? `?date=${encodeURIComponent(date)}` : '';
+    return authorizedFetch<DoctorPayoutReportResponse & { correlationId: string }>(
+      `/clinic/doctor-payouts${qs}`,
+      { tenantId }
+    );
+  },
+
+  upsertDoctorCommission: (tenantId: string, payload: UpsertDoctorCommissionInput) =>
+    authorizedFetch('/clinic/doctor-commissions', {
+      method: 'PUT',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  // Pharmacy Alerts, Stocktakes, Multi-Branch Transfers, Dispense Queue & Z-Report
+  getPharmacyAlerts: (tenantId: string) =>
+    authorizedFetch<StockAlertsDashboardResponse & { correlationId: string }>('/pharmacy/alerts', {
+      tenantId,
+    }),
+
+  getStocktakes: (tenantId: string) =>
+    authorizedFetch<{
+      stocktakes: Array<{
+        id: string;
+        status: 'open' | 'reconciled';
+        notes: string;
+        createdAt: string;
+        reconciledAt: string | null;
+        lines: Array<{
+          id: string;
+          productId: string;
+          productName: string;
+          lotId: string;
+          batchNumber: string;
+          systemQtyBase: number;
+          countedQtyBase: number | null;
+          varianceQtyBase: number | null;
+          reason: string;
+        }>;
+      }>;
+      correlationId: string;
+    }>('/pharmacy/stocktakes', { tenantId }),
+
+  createStocktake: (tenantId: string, notes?: string) =>
+    authorizedFetch('/pharmacy/stocktakes', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify({ notes: notes ?? '' }),
+    }),
+
+  submitStocktakeCounts: (
+    tenantId: string,
+    stocktakeId: string,
+    counts: Array<{ lineId: string; countedQtyBase: number; reason?: string }>
+  ) =>
+    authorizedFetch(`/pharmacy/stocktakes/${stocktakeId}/counts`, {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify({ counts }),
+    }),
+
+  reconcileStocktake: (tenantId: string, stocktakeId: string) =>
+    authorizedFetch(`/pharmacy/stocktakes/${stocktakeId}/reconcile`, {
+      method: 'POST',
+      tenantId,
+    }),
+
+  getStockTransfers: (tenantId: string) =>
+    authorizedFetch<{
+      transfers: Array<{
+        id: string;
+        transferNumber: string;
+        fromBranchId: string;
+        fromBranchName: string;
+        toBranchId: string;
+        toBranchName: string;
+        status: 'in_transit' | 'received_quarantine' | 'received_sellable';
+        notes: string;
+        createdAt: string;
+        receivedAt: string | null;
+        lines: Array<{
+          id: string;
+          productId: string;
+          productName: string;
+          lotId: string;
+          batchNumber: string;
+          qtyBase: number;
+        }>;
+      }>;
+      correlationId: string;
+    }>('/pharmacy/transfers', { tenantId }),
+
+  createStockTransfer: (tenantId: string, payload: CreateStockTransferInput) =>
+    authorizedFetch('/pharmacy/transfers', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  receiveStockTransfer: (
+    tenantId: string,
+    transferId: string,
+    payload: { receiveIntoSellable: boolean; notes?: string }
+  ) =>
+    authorizedFetch(`/pharmacy/transfers/${transferId}/receive`, {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  getDispenseQueue: (tenantId: string) =>
+    authorizedFetch<{
+      orders: Array<{
+        id: string;
+        orderNumber: string;
+        personId: string;
+        personName: string;
+        appointmentId: string | null;
+        prescriberName: string;
+        clinicalNotes: string;
+        status: 'pending' | 'dispensed' | 'cancelled';
+        posSaleId: string | null;
+        createdAt: string;
+        lines: Array<{
+          id: string;
+          productId: string;
+          productName: string;
+          packVariantId: string;
+          variantName: string;
+          qtyPacks: number;
+          dosageInstruction: string;
+        }>;
+      }>;
+      correlationId: string;
+    }>('/pharmacy/dispense-queue', { tenantId }),
+
+  createDispenseOrder: (tenantId: string, payload: CreateDispenseOrderInput) =>
+    authorizedFetch('/pharmacy/dispense-queue', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  updateDispenseOrderStatus: (
+    tenantId: string,
+    orderId: string,
+    payload: { status: 'dispensed' | 'cancelled'; posSaleId?: string | null }
+  ) =>
+    authorizedFetch(`/pharmacy/dispense-queue/${orderId}/status`, {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  getCombinedZReport: (tenantId: string, date?: string) => {
+    const qs = date ? `?date=${encodeURIComponent(date)}` : '';
+    return authorizedFetch<{ report: CombinedZReportResponse; correlationId: string }>(
+      `/reports/z-report${qs}`,
+      { tenantId }
+    );
+  },
+
+  fetchCombinedZReportCsv: async (tenantId: string, date?: string): Promise<string> => {
+    const currentUser = auth.currentUser;
+    if (!currentUser) throw new Error('Please sign in first.');
+    const token = await currentUser.getIdToken(false);
+    const qs = date ? `?date=${encodeURIComponent(date)}` : '';
+    const res = await fetch(`/api/v1/reports/z-report.csv${qs}`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'X-Tenant-Id': tenantId,
+      },
+      cache: 'no-store',
+    });
+    if (!res.ok) {
+      throw new Error('Unable to download CSV report.');
+    }
+    return res.text();
+  },
+
+  // Team Multi-Branch, Invites, Role Updates & Shift PIN Lock
+  getWorkspaceBranches: (tenantId: string) =>
+    authorizedFetch<{
+      branches: Array<{
+        id: string;
+        name: string;
+        code: string;
+        openingHoursSummary: string;
+        active: boolean;
+      }>;
+      correlationId: string;
+    }>('/platform/branches', { tenantId }),
+
+  createWorkspaceBranch: (tenantId: string, payload: CreateBranchInput) =>
+    authorizedFetch('/platform/branches', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  getStaffInvites: (tenantId: string) =>
+    authorizedFetch<{
+      invites: Array<{
+        id: string;
+        email: string;
+        displayName: string;
+        role: string;
+        branchId: string;
+        branchName: string;
+        token: string;
+        status: string;
+        createdAt: string;
+      }>;
+      correlationId: string;
+    }>('/platform/invites', { tenantId }),
+
+  createStaffInvite: (tenantId: string, payload: CreateStaffInviteInput) =>
+    authorizedFetch('/platform/invites', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  revokeStaffInvite: (tenantId: string, inviteId: string) =>
+    authorizedFetch(`/platform/invites/${inviteId}`, {
+      method: 'DELETE',
+      tenantId,
+    }),
+
+  acceptStaffInvite: (token: string) =>
+    authorizedFetch(`/platform/invites/${encodeURIComponent(token)}/accept`, {
+      method: 'POST',
+    }),
+
+  updateTeamMembership: (
+    tenantId: string,
+    membershipId: string,
+    payload: { role?: string; branchId?: string; active?: boolean }
+  ) =>
+    authorizedFetch(`/platform/team/${membershipId}`, {
+      method: 'PATCH',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  setShiftPin: (tenantId: string, pin: string) =>
+    authorizedFetch<{ configured: boolean; correlationId: string }>('/platform/shift-pin/set', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify({ pin }),
+    }),
+
+  verifyShiftPin: (tenantId: string, pin: string) =>
+    authorizedFetch<{ verified: boolean; correlationId: string }>('/platform/shift-pin/verify', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify({ pin }),
+    }),
+
+  // Accounts Department: Daily OpEx, Net P&L, Receivables & Payables
+  getAccountsOverview: (tenantId: string, date?: string) => {
+    const qs = date ? `?date=${encodeURIComponent(date)}` : '';
+    return authorizedFetch<{ overview: AccountsOverviewResponse; correlationId: string }>(
+      `/accounts/overview${qs}`,
+      { tenantId }
+    );
+  },
+
+  recordOperatingExpense: (tenantId: string, payload: RecordOperatingExpenseInput) =>
+    authorizedFetch('/accounts/expenses', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  voidOperatingExpense: (tenantId: string, expenseId: string) =>
+    authorizedFetch(`/accounts/expenses/${expenseId}/void`, {
+      method: 'POST',
+      tenantId,
+    }),
+
+  createReceivableAccount: (tenantId: string, payload: CreateCreditAccountInput) =>
+    authorizedFetch('/accounts/receivables/accounts', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  recordReceivableEntry: (
+    tenantId: string,
+    accountId: string,
+    payload: RecordCreditEntryInput
+  ) =>
+    authorizedFetch(`/accounts/receivables/accounts/${accountId}/entries`, {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  recordSupplierPayment: (tenantId: string, payload: RecordSupplierPaymentInput) =>
+    authorizedFetch('/accounts/payables/payments', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  // Purchasing Department: Purchase Orders & Supplier Debit Notes
+  getPurchasingOverview: (tenantId: string) =>
+    authorizedFetch<{ overview: PurchasingOverviewResponse; correlationId: string }>(
+      '/purchasing/overview',
+      { tenantId }
+    ),
+
+  createPurchaseOrder: (tenantId: string, payload: CreatePurchaseOrderInput) =>
+    authorizedFetch('/purchasing/orders', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  approvePurchaseOrder: (tenantId: string, poId: string) =>
+    authorizedFetch(`/purchasing/orders/${poId}/approve`, {
+      method: 'POST',
+      tenantId,
+    }),
+
+  convertPoToGrn: (tenantId: string, poId: string, payload: ConvertPoToGrnInput) =>
+    authorizedFetch(`/purchasing/orders/${poId}/convert-to-grn`, {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  createSupplierDebitNote: (tenantId: string, payload: CreateSupplierDebitNoteInput) =>
+    authorizedFetch('/purchasing/debit-notes', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  // HR, Payroll & Admin Operations Department
+  getHrAdminOverview: (tenantId: string) =>
+    authorizedFetch<{ overview: HrAdminOverviewResponse; correlationId: string }>(
+      '/hr-admin/overview',
+      { tenantId }
+    ),
+
+  upsertHrProfile: (tenantId: string, payload: UpsertHrProfileInput) =>
+    authorizedFetch('/hr-admin/profiles', {
+      method: 'PUT',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  clockInStaff: (tenantId: string, payload: { pin?: string; notes?: string }) =>
+    authorizedFetch('/hr-admin/attendance/clock-in', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  clockOutStaff: (tenantId: string, payload: { pin?: string; notes?: string }) =>
+    authorizedFetch('/hr-admin/attendance/clock-out', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  requestLeave: (tenantId: string, payload: RequestLeaveInput) =>
+    authorizedFetch('/hr-admin/leaves', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  reviewLeaveRequest: (
+    tenantId: string,
+    leaveId: string,
+    decision: 'approved' | 'rejected'
+  ) =>
+    authorizedFetch(`/hr-admin/leaves/${leaveId}/review`, {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify({ decision }),
+    }),
+
+  generateMonthlyPayroll: (tenantId: string, payrollMonth: string) =>
+    authorizedFetch('/hr-admin/payroll/generate', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify({ payrollMonth }),
+    }),
+
+  createLabOrder: (tenantId: string, payload: CreateLabOrderInput) =>
+    authorizedFetch('/hr-admin/lab-orders', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  updateLabOrderStatus: (
+    tenantId: string,
+    orderId: string,
+    payload: {
+      status: 'ordered' | 'sample_collected' | 'report_ready' | 'cancelled';
+      resultSummary?: string;
+    }
+  ) =>
+    authorizedFetch(`/hr-admin/lab-orders/${orderId}`, {
+      method: 'PATCH',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  recordColdChainTemp: (
+    tenantId: string,
+    payload: { fridgeName: string; temperatureC: number; notes?: string }
+  ) =>
+    authorizedFetch('/hr-admin/cold-chain', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify(payload),
+    }),
+
+  createComplianceLicense: (
+    tenantId: string,
+    payload: {
+      title: string;
+      authority: 'NMRA' | 'SLMC' | 'BR' | 'PHI' | 'OTHER';
+      licenseNumber: string;
+      expiresOn: string;
+      alertDaysBefore?: number;
+      notes?: string;
+    }
+  ) =>
+    authorizedFetch('/hr-admin/licenses', {
       method: 'POST',
       tenantId,
       body: JSON.stringify(payload),

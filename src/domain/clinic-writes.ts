@@ -1,8 +1,9 @@
 import crypto from 'node:crypto';
 import { and, desc, eq, ilike, or, sql } from 'drizzle-orm';
-import { db } from '../db/index.ts';
+import { db, isDatabaseConfigured } from '../db/index.ts';
 import {
   actionProposals,
+  appointmentQueueTokens,
   appointments,
   auditEvents,
   charges,
@@ -32,6 +33,8 @@ import {
   RescheduleAppointmentSchema,
 } from '../contracts/clinic.ts';
 import { ConflictError, NotFoundError, ValidationError } from './errors.ts';
+import { addMemAuditEvent, getMemoryStore } from './memory-store.ts';
+import { assertWorkspaceNotReadOnlyGrace } from './subscription-billing.ts';
 import {
   type ActiveWorkspaceContext,
   assertCapability,
@@ -65,6 +68,24 @@ export async function listPeopleForTenant(context: ActiveWorkspaceContext, query
   assertPermission(context, 'directory.read');
 
   const trimmed = query?.trim();
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const pattern = trimmed?.toLowerCase();
+    return store.people
+      .filter((p) => {
+        if (p.tenantId !== context.tenantId) return false;
+        if (!pattern) return true;
+        return (
+          p.displayName.toLowerCase().includes(pattern) ||
+          p.phone.toLowerCase().includes(pattern) ||
+          p.phoneLast4.includes(pattern)
+        );
+      })
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+      .slice(0, 100);
+  }
+
   const rows = await db
     .select()
     .from(people)
@@ -93,10 +114,58 @@ export async function createPersonForTenant(
 ) {
   assertCapability(context, 'appointments.manage');
   assertPermission(context, 'appointments.write');
+  await assertWorkspaceNotReadOnlyGrace(context.tenantId, context.timezone);
 
   const normName = normalizeName(input.displayName);
   const phoneClean = input.phone.trim();
   const last4 = normalizePhoneLast4(phoneClean);
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    if (!input.confirmDuplicate) {
+      const potentialDuplicates = store.people.filter(
+        (p) =>
+          p.tenantId === context.tenantId &&
+          (p.normalizedName === normName || (Boolean(last4) && p.phoneLast4 === last4))
+      );
+      if (potentialDuplicates.length > 0) {
+        throw new ConflictError(
+          `Possible duplicate record found (${potentialDuplicates[0].displayName}). Review existing records or confirm creation.`,
+          'POSSIBLE_DUPLICATE_PERSON',
+          'errors.possible_duplicate_person'
+        );
+      }
+    }
+
+    const created = {
+      id: crypto.randomUUID(),
+      tenantId: context.tenantId,
+      branchId: context.branchId,
+      displayName: input.displayName.trim(),
+      normalizedName: normName,
+      aliasesJson: input.aliases,
+      phone: phoneClean,
+      phoneLast4: last4,
+      notes: input.notes.trim(),
+      isSample: false,
+      version: 1,
+      createdAt: new Date(),
+    };
+    store.people.push(created);
+
+    addMemAuditEvent({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'person.created',
+      entityType: 'person',
+      entityId: created.id,
+      correlationId,
+      metadataJson: { confirmDuplicate: input.confirmDuplicate },
+    });
+
+    return created;
+  }
 
   // Duplicate disambiguation check (U05) unless explicitly confirmed by operator
   if (!input.confirmDuplicate) {
@@ -173,6 +242,41 @@ export async function updatePersonForTenant(
 ) {
   assertCapability(context, 'appointments.manage');
   assertPermission(context, 'appointments.write');
+  await assertWorkspaceNotReadOnlyGrace(context.tenantId, context.timezone);
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const existing = store.people.find((p) => p.tenantId === context.tenantId && p.id === personId);
+    if (!existing) throw new NotFoundError('Patient record not found');
+    if (existing.version !== input.expectedVersion) {
+      throw new ConflictError(
+        'Patient record was modified by another user. Refresh and retry.',
+        'VERSION_CONFLICT',
+        'errors.version_conflict'
+      );
+    }
+    const nextDisplayName = input.displayName?.trim() ?? existing.displayName;
+    const nextPhone = input.phone !== undefined ? input.phone.trim() : existing.phone;
+    existing.displayName = nextDisplayName;
+    existing.normalizedName = normalizeName(nextDisplayName);
+    existing.phone = nextPhone;
+    existing.phoneLast4 = normalizePhoneLast4(nextPhone);
+    if (input.aliases !== undefined) existing.aliasesJson = input.aliases;
+    if (input.notes !== undefined) existing.notes = input.notes.trim();
+    existing.version += 1;
+
+    addMemAuditEvent({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'person.updated',
+      entityType: 'person',
+      entityId: personId,
+      correlationId,
+      metadataJson: { newVersion: existing.version },
+    });
+    return existing;
+  }
 
   return db.transaction(async (tx) => {
     const [existing] = await tx
@@ -227,7 +331,7 @@ export async function updatePersonForTenant(
 }
 
 // ------------------------------------------------------------
-// 2. Appointments: Book, Reschedule & Status Transitions (btree_gist overlap protected)
+// 2. Appointments: Book, Reschedule & Status Transitions
 // ------------------------------------------------------------
 export async function createAppointmentForTenant(
   context: ActiveWorkspaceContext,
@@ -238,8 +342,142 @@ export async function createAppointmentForTenant(
 ) {
   assertCapability(context, 'appointments.manage');
   assertPermission(context, 'appointments.write');
+  await assertWorkspaceNotReadOnlyGrace(context.tenantId, context.timezone);
 
   const payloadHash = hashCanonical(input);
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const existingCmd = store.commands.find(
+      (c) =>
+        c.tenantId === context.tenantId &&
+        c.actorUserId === context.userId &&
+        c.commandType === 'clinic.appointment.create' &&
+        c.idempotencyKey === input.idempotencyKey
+    );
+    if (existingCmd && existingCmd.state === 'committed' && existingCmd.resultJson) {
+      if (existingCmd.payloadHash !== payloadHash) {
+        throw new ConflictError('Idempotency key already used with different appointment payload');
+      }
+      return existingCmd.resultJson;
+    }
+
+    const person = store.people.find((p) => p.tenantId === context.tenantId && p.id === input.personId);
+    if (!person) throw new NotFoundError('Patient record not found');
+
+    const service = store.services.find(
+      (s) => s.tenantId === context.tenantId && s.id === input.serviceId && s.active
+    );
+    if (!service) throw new NotFoundError('Clinic service not found');
+
+    const resource = store.resources.find(
+      (r) => r.tenantId === context.tenantId && r.id === input.resourceId && r.active
+    );
+    if (!resource) throw new NotFoundError('Practitioner / resource not found');
+
+    const startsAt = new Date(input.startsAt);
+    if (Number.isNaN(startsAt.getTime())) {
+      throw new ValidationError('Invalid appointment start time');
+    }
+    const endsAt = new Date(startsAt.getTime() + service.durationMinutes * 60_000);
+    const businessDate = getBusinessDateInTimezone(context.timezone, startsAt);
+
+    const overlap = store.appointments.find(
+      (a) =>
+        a.tenantId === context.tenantId &&
+        a.resourceId === resource.id &&
+        a.status !== 'cancelled' &&
+        startsAt < a.endsAt &&
+        endsAt > a.startsAt
+    );
+    if (overlap) {
+      throw new ConflictError(
+        'Selected practitioner already has an overlapping appointment in that time slot.',
+        'APPOINTMENT_OVERLAP',
+        'errors.appointment_overlap'
+      );
+    }
+
+    const created = {
+      id: crypto.randomUUID(),
+      tenantId: context.tenantId,
+      branchId: context.branchId,
+      personId: person.id,
+      serviceId: service.id,
+      resourceId: resource.id,
+      startsAt,
+      endsAt,
+      businessDate,
+      status: 'scheduled' as const,
+      bookedDurationMinutes: service.durationMinutes,
+      bookedPriceMinor: service.priceMinor,
+      currency: context.currency,
+      notes: input.notes.trim(),
+      isSample: false,
+      version: 1,
+      createdByUserId: context.userId,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    store.appointments.push(created);
+
+    const existingTokens = store.appointmentQueueTokens.filter(
+      (t) =>
+        t.tenantId === context.tenantId &&
+        t.branchId === context.branchId &&
+        t.businessDate === businessDate
+    );
+    const nextToken =
+      existingTokens.reduce((max, t) => (t.tokenNumber > max ? t.tokenNumber : max), 0) + 1;
+    store.appointmentQueueTokens.push({
+      id: crypto.randomUUID(),
+      tenantId: context.tenantId,
+      branchId: context.branchId,
+      businessDate,
+      appointmentId: created.id,
+      resourceId: resource.id,
+      tokenNumber: nextToken,
+      queueState: 'waiting',
+      delayMinutes: 0,
+      calledAt: null,
+      createdAt: new Date(),
+    });
+
+    const result = {
+      appointment: created,
+      personName: person.displayName,
+      serviceName: service.name,
+      resourceName: resource.name,
+      tokenNumber: nextToken,
+    };
+
+    store.commands.push({
+      id: crypto.randomUUID(),
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      commandType: 'clinic.appointment.create',
+      idempotencyKey: input.idempotencyKey,
+      payloadHash,
+      proposalId: proposalId ?? null,
+      state: 'committed',
+      resultJson: result,
+      committedAt: new Date(),
+    });
+
+    addMemAuditEvent({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'appointment.created',
+      entityType: 'appointment',
+      entityId: created.id,
+      inputSource,
+      correlationId,
+      metadataJson: { businessDate, tokenNumber: nextToken, startsAt: startsAt.toISOString(), resourceId: resource.id },
+    });
+
+    return result;
+  }
 
   const [existingCmd] = await db
     .select()
@@ -337,11 +575,36 @@ export async function createAppointmentForTenant(
         })
         .returning();
 
+      const [maxTokenRow] = await tx
+        .select({
+          maxNum: sql<number>`COALESCE(MAX(${appointmentQueueTokens.tokenNumber}), 0)::int`,
+        })
+        .from(appointmentQueueTokens)
+        .where(
+          and(
+            eq(appointmentQueueTokens.tenantId, context.tenantId),
+            eq(appointmentQueueTokens.branchId, context.branchId),
+            eq(appointmentQueueTokens.businessDate, businessDate)
+          )
+        );
+      const nextToken = (maxTokenRow?.maxNum ?? 0) + 1;
+
+      await tx.insert(appointmentQueueTokens).values({
+        tenantId: context.tenantId,
+        branchId: context.branchId,
+        businessDate,
+        appointmentId: created.id,
+        resourceId: resource.id,
+        tokenNumber: nextToken,
+        queueState: 'waiting',
+      });
+
       const result = {
         appointment: created,
         personName: person.displayName,
         serviceName: service.name,
         resourceName: resource.name,
+        tokenNumber: nextToken,
       };
 
       await tx
@@ -358,7 +621,12 @@ export async function createAppointmentForTenant(
         entityId: created.id,
         inputSource,
         correlationId,
-        metadataJson: { businessDate, startsAt: startsAt.toISOString(), resourceId: resource.id },
+        metadataJson: {
+          businessDate,
+          tokenNumber: nextToken,
+          startsAt: startsAt.toISOString(),
+          resourceId: resource.id,
+        },
       });
 
       await tx.insert(outboxEvents).values({
@@ -391,8 +659,106 @@ export async function rescheduleAppointmentForTenant(
 ) {
   assertCapability(context, 'appointments.manage');
   assertPermission(context, 'appointments.write');
+  await assertWorkspaceNotReadOnlyGrace(context.tenantId, context.timezone);
 
   const payloadHash = hashCanonical({ appointmentId, ...input });
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const existingCmd = store.commands.find(
+      (c) =>
+        c.tenantId === context.tenantId &&
+        c.actorUserId === context.userId &&
+        c.commandType === 'clinic.appointment.reschedule' &&
+        c.idempotencyKey === input.idempotencyKey
+    );
+    if (existingCmd && existingCmd.state === 'committed' && existingCmd.resultJson) {
+      return existingCmd.resultJson;
+    }
+
+    const existing = store.appointments.find(
+      (a) => a.tenantId === context.tenantId && a.id === appointmentId
+    );
+    if (!existing) throw new NotFoundError('Appointment not found');
+    if (existing.version !== input.expectedVersion) {
+      throw new ConflictError(
+        'Appointment was updated elsewhere. Refresh and retry.',
+        'VERSION_CONFLICT',
+        'errors.version_conflict'
+      );
+    }
+    if (existing.status === 'cancelled' || existing.status === 'completed') {
+      throw new ConflictError('Cannot reschedule a completed or cancelled appointment');
+    }
+
+    const nextResourceId = input.resourceId ?? existing.resourceId;
+    if (input.resourceId) {
+      const resRow = store.resources.find(
+        (r) => r.tenantId === context.tenantId && r.id === input.resourceId
+      );
+      if (!resRow) throw new NotFoundError('Target practitioner not found');
+    }
+
+    const startsAt = new Date(input.startsAt);
+    if (Number.isNaN(startsAt.getTime())) {
+      throw new ValidationError('Invalid appointment start time');
+    }
+    const endsAt = new Date(startsAt.getTime() + existing.bookedDurationMinutes * 60_000);
+    const businessDate = getBusinessDateInTimezone(context.timezone, startsAt);
+
+    const overlap = store.appointments.find(
+      (a) =>
+        a.tenantId === context.tenantId &&
+        a.id !== appointmentId &&
+        a.resourceId === nextResourceId &&
+        a.status !== 'cancelled' &&
+        startsAt < a.endsAt &&
+        endsAt > a.startsAt
+    );
+    if (overlap) {
+      throw new ConflictError(
+        'Selected practitioner already has an overlapping appointment in that time slot.',
+        'APPOINTMENT_OVERLAP',
+        'errors.appointment_overlap'
+      );
+    }
+
+    existing.resourceId = nextResourceId;
+    existing.startsAt = startsAt;
+    existing.endsAt = endsAt;
+    existing.businessDate = businessDate;
+    if (input.notes !== undefined) existing.notes = input.notes.trim();
+    existing.version += 1;
+    existing.updatedAt = new Date();
+
+    const result = { appointment: existing };
+    store.commands.push({
+      id: crypto.randomUUID(),
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      commandType: 'clinic.appointment.reschedule',
+      idempotencyKey: input.idempotencyKey,
+      payloadHash,
+      proposalId: proposalId ?? null,
+      state: 'committed',
+      resultJson: result,
+      committedAt: new Date(),
+    });
+
+    addMemAuditEvent({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'appointment.rescheduled',
+      entityType: 'appointment',
+      entityId: appointmentId,
+      inputSource,
+      correlationId,
+      metadataJson: { newStartsAt: startsAt.toISOString(), newVersion: existing.version },
+    });
+
+    return result;
+  }
 
   const [existingCmd] = await db
     .select()
@@ -540,6 +906,54 @@ export async function transitionAppointmentStatusForTenant(
   } else {
     assertPermission(context, 'appointments.write');
   }
+  await assertWorkspaceNotReadOnlyGrace(context.tenantId, context.timezone);
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const existing = store.appointments.find(
+      (a) => a.tenantId === context.tenantId && a.id === appointmentId
+    );
+    if (!existing) throw new NotFoundError('Appointment not found');
+    if (existing.version !== input.expectedVersion) {
+      throw new ConflictError(
+        'Appointment was modified elsewhere. Refresh and retry.',
+        'VERSION_CONFLICT'
+      );
+    }
+    const allowed = ALLOWED_APPT_TRANSITIONS[existing.status] ?? [];
+    if (!allowed.includes(input.status)) {
+      throw new ConflictError(
+        `Cannot transition appointment from ${existing.status} to ${input.status}`
+      );
+    }
+
+    const from = existing.status;
+    existing.status = input.status;
+    if (input.notes !== undefined) existing.notes = input.notes.trim();
+    existing.version += 1;
+    existing.updatedAt = new Date();
+
+    const tok = store.appointmentQueueTokens.find(
+      (t) => t.tenantId === context.tenantId && t.appointmentId === appointmentId
+    );
+    if (tok) {
+      if (input.status === 'completed') tok.queueState = 'completed';
+      else if (input.status === 'cancelled' || input.status === 'no_show') tok.queueState = 'skipped';
+    }
+
+    addMemAuditEvent({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: `appointment.status.${input.status}`,
+      entityType: 'appointment',
+      entityId: appointmentId,
+      correlationId,
+      metadataJson: { from, to: input.status },
+    });
+
+    return { appointment: existing };
+  }
 
   return db.transaction(async (tx) => {
     const [existing] = await tx
@@ -575,6 +989,18 @@ export async function transitionAppointmentStatusForTenant(
       .where(and(eq(appointments.tenantId, context.tenantId), eq(appointments.id, appointmentId)))
       .returning();
 
+    if (input.status === 'completed' || input.status === 'cancelled' || input.status === 'no_show') {
+      await tx
+        .update(appointmentQueueTokens)
+        .set({ queueState: input.status === 'completed' ? 'completed' : 'skipped' })
+        .where(
+          and(
+            eq(appointmentQueueTokens.tenantId, context.tenantId),
+            eq(appointmentQueueTokens.appointmentId, appointmentId)
+          )
+        );
+    }
+
     await tx.insert(auditEvents).values({
       tenantId: context.tenantId,
       actorUserId: context.userId,
@@ -605,6 +1031,36 @@ export async function listClinicPaymentsAndReceipts(context: ActiveWorkspaceCont
   assertPermission(context, 'reports.branch_summary');
 
   const canViewAll = context.permissions.includes('reports.all_financials');
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    return store.payments
+      .filter(
+        (p) =>
+          p.tenantId === context.tenantId &&
+          (canViewAll || p.recordedByUserId === context.userId)
+      )
+      .sort((a, b) => b.recordedAt.getTime() - a.recordedAt.getTime())
+      .slice(0, 50)
+      .map((p) => {
+        const person = store.people.find((per) => per.id === p.personId);
+        const rcp = store.receipts.find((r) => r.paymentId === p.id);
+        return {
+          paymentId: p.id,
+          amountMinor: p.amountMinor,
+          currency: p.currency,
+          method: p.method,
+          referenceNumber: p.referenceNumber,
+          status: p.status,
+          recordedAt: p.recordedAt,
+          recordedByUserId: p.recordedByUserId,
+          personId: p.personId,
+          personName: person?.displayName ?? 'Patient',
+          receiptNumber: rcp?.receiptNumber ?? null,
+          receiptSnapshot: rcp?.snapshotJson ?? null,
+        };
+      });
+  }
 
   const rows = await db
     .select({
@@ -650,8 +1106,133 @@ export async function recordClinicPaymentForTenant(
 ) {
   assertCapability(context, 'collections.record');
   assertPermission(context, 'payments.record');
+  await assertWorkspaceNotReadOnlyGrace(context.tenantId, context.timezone);
 
   const payloadHash = hashCanonical(input);
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const existingCmd = store.commands.find(
+      (c) =>
+        c.tenantId === context.tenantId &&
+        c.actorUserId === context.userId &&
+        c.commandType === 'clinic.payment.record' &&
+        c.idempotencyKey === input.idempotencyKey
+    );
+    if (existingCmd && existingCmd.state === 'committed' && existingCmd.resultJson) {
+      return existingCmd.resultJson;
+    }
+
+    const person = store.people.find((p) => p.tenantId === context.tenantId && p.id === input.personId);
+    if (!person) throw new NotFoundError('Patient record not found');
+
+    if (input.appointmentId) {
+      const apt = store.appointments.find(
+        (a) => a.tenantId === context.tenantId && a.id === input.appointmentId
+      );
+      if (!apt) throw new NotFoundError('Linked appointment not found');
+    }
+
+    const now = new Date();
+    const charge = {
+      id: crypto.randomUUID(),
+      tenantId: context.tenantId,
+      branchId: context.branchId,
+      personId: person.id,
+      appointmentId: input.appointmentId ?? null,
+      description: input.description.trim(),
+      currency: context.currency,
+      grossAmountMinor: input.amountMinor,
+      creditedAmountMinor: input.amountMinor,
+      version: 1,
+      createdByUserId: context.userId,
+      createdAt: now,
+    };
+    store.charges.push(charge);
+
+    const payment = {
+      id: crypto.randomUUID(),
+      tenantId: context.tenantId,
+      branchId: context.branchId,
+      personId: person.id,
+      amountMinor: input.amountMinor,
+      currency: context.currency,
+      method: input.method,
+      referenceNumber: input.referenceNumber.trim(),
+      status: 'posted' as const,
+      effectiveAt: now,
+      recordedAt: now,
+      recordedByUserId: context.userId,
+    };
+    store.payments.push(payment);
+
+    store.paymentAllocations.push({
+      id: crypto.randomUUID(),
+      tenantId: context.tenantId,
+      paymentId: payment.id,
+      chargeId: charge.id,
+      amountMinor: input.amountMinor,
+      currency: context.currency,
+      active: true,
+    });
+
+    const businessDate = getBusinessDateInTimezone(context.timezone);
+    const receiptNumber = `CLN-${businessDate.replace(/-/g, '')}-${crypto
+      .randomBytes(3)
+      .toString('hex')
+      .toUpperCase()}`;
+
+    const snapshotJson = {
+      receiptNumber,
+      tenantName: context.tenantName,
+      branchName: context.branchName,
+      personName: person.displayName,
+      description: charge.description,
+      amountMinor: payment.amountMinor,
+      currency: payment.currency,
+      method: payment.method,
+      referenceNumber: payment.referenceNumber,
+      recordedAt: payment.recordedAt.toISOString(),
+    };
+
+    const receipt = {
+      id: crypto.randomUUID(),
+      tenantId: context.tenantId,
+      paymentId: payment.id,
+      receiptNumber,
+      snapshotJson,
+      issuedAt: now,
+    };
+    store.receipts.push(receipt);
+
+    const result = { charge, payment, receipt };
+    store.commands.push({
+      id: crypto.randomUUID(),
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      commandType: 'clinic.payment.record',
+      idempotencyKey: input.idempotencyKey,
+      payloadHash,
+      proposalId: proposalId ?? null,
+      state: 'committed',
+      resultJson: result,
+      committedAt: now,
+    });
+
+    addMemAuditEvent({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'clinic.payment.recorded',
+      entityType: 'payment',
+      entityId: payment.id,
+      inputSource,
+      correlationId,
+      metadataJson: { receiptNumber, amountMinor: payment.amountMinor, method: payment.method },
+    });
+
+    return result;
+  }
 
   const [existingCmd] = await db
     .select()
@@ -814,6 +1395,42 @@ export async function voidClinicPaymentForTenant(
 ) {
   assertCapability(context, 'collections.record');
   assertPermission(context, 'payments.reverse_stepup');
+  await assertWorkspaceNotReadOnlyGrace(context.tenantId, context.timezone);
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const payment = store.payments.find(
+      (p) => p.tenantId === context.tenantId && p.id === paymentId
+    );
+    if (!payment) throw new NotFoundError('Payment record not found');
+    if (payment.status === 'voided') throw new ConflictError('Payment is already voided');
+
+    payment.status = 'voided';
+    for (const alloc of store.paymentAllocations) {
+      if (alloc.tenantId === context.tenantId && alloc.paymentId === paymentId && alloc.active) {
+        alloc.active = false;
+        const charge = store.charges.find(
+          (c) => c.tenantId === context.tenantId && c.id === alloc.chargeId
+        );
+        if (charge) {
+          charge.creditedAmountMinor = Math.max(0, charge.creditedAmountMinor - alloc.amountMinor);
+          charge.version += 1;
+        }
+      }
+    }
+
+    addMemAuditEvent({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'clinic.payment.voided',
+      entityType: 'payment',
+      entityId: paymentId,
+      correlationId,
+      metadataJson: { reason: input.reason, amountMinor: payment.amountMinor },
+    });
+    return { payment };
+  }
 
   return db.transaction(async (tx) => {
     const [payment] = await tx
@@ -895,6 +1512,7 @@ export async function prepareActionProposal(
   correlationId: string
 ) {
   assertCapability(context, 'appointments.manage');
+  await assertWorkspaceNotReadOnlyGrace(context.tenantId, context.timezone);
 
   if (input.actionType === 'create_appointment') {
     assertPermission(context, 'appointments.write');
@@ -923,6 +1541,37 @@ export async function prepareActionProposal(
   const nonce = crypto.randomBytes(12).toString('hex');
   const payloadHash = hashCanonical(input.payload);
   const expiresAt = new Date(Date.now() + 15 * 60_000);
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const proposal = {
+      id: crypto.randomUUID(),
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actionType: input.actionType,
+      canonicalPayloadJson: input.payload,
+      payloadHash,
+      nonce,
+      state: 'draft' as const,
+      expiresAt,
+      consumedAt: null,
+      createdAt: new Date(),
+    };
+    store.actionProposals.push(proposal);
+
+    addMemAuditEvent({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'assistant.proposal_prepared',
+      entityType: 'action_proposal',
+      entityId: proposal.id,
+      inputSource: input.inputSource,
+      correlationId,
+      metadataJson: { actionType: input.actionType },
+    });
+    return proposal;
+  }
 
   const [proposal] = await db
     .insert(actionProposals)
@@ -959,6 +1608,62 @@ export async function confirmActionProposal(
   input: ConfirmActionProposalInput,
   correlationId: string
 ) {
+  await assertWorkspaceNotReadOnlyGrace(context.tenantId, context.timezone);
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const proposal = store.actionProposals.find(
+      (p) =>
+        p.tenantId === context.tenantId &&
+        p.id === proposalId &&
+        p.actorUserId === context.userId
+    );
+    if (!proposal) throw new NotFoundError('Action proposal not found');
+    if (proposal.state !== 'draft') {
+      throw new ConflictError(`Proposal is already ${proposal.state}`);
+    }
+    if (proposal.nonce !== input.nonce) {
+      throw new ConflictError('Proposal confirmation nonce mismatch');
+    }
+    if (proposal.expiresAt.getTime() < Date.now()) {
+      proposal.state = 'expired';
+      throw new ConflictError('Action proposal expired. Please prepare again.');
+    }
+
+    const payload = proposal.canonicalPayloadJson;
+    let result: unknown;
+    if (proposal.actionType === 'create_appointment') {
+      const parsed = CreateAppointmentSchema.parse({ ...payload, idempotencyKey: input.idempotencyKey });
+      result = await createAppointmentForTenant(context, parsed, correlationId, proposal.id, 'voice');
+    } else if (proposal.actionType === 'reschedule_appointment') {
+      const appointmentId = String(payload.appointmentId || '');
+      const parsed = RescheduleAppointmentSchema.parse({
+        ...payload,
+        idempotencyKey: input.idempotencyKey,
+      });
+      result = await rescheduleAppointmentForTenant(
+        context,
+        appointmentId,
+        parsed,
+        correlationId,
+        proposal.id,
+        'voice'
+      );
+    } else if (proposal.actionType === 'record_payment') {
+      const parsed = RecordClinicPaymentSchema.parse({
+        ...payload,
+        idempotencyKey: input.idempotencyKey,
+      });
+      result = await recordClinicPaymentForTenant(context, parsed, correlationId, proposal.id, 'voice');
+    } else {
+      throw new ValidationError(`Unsupported proposal actionType ${proposal.actionType}`);
+    }
+
+    proposal.state = 'consumed';
+    proposal.consumedAt = new Date();
+    return { proposalId: proposal.id, actionType: proposal.actionType, result };
+  }
+
   const [proposal] = await db
     .select()
     .from(actionProposals)

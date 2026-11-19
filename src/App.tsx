@@ -13,6 +13,12 @@ import { PharmacyPosPage } from './pages/PharmacyPosPage.tsx';
 import { PharmacyReceivingPage } from './pages/PharmacyReceivingPage.tsx';
 import { PharmacyStockPage } from './pages/PharmacyStockPage.tsx';
 import { PlatformModulesPage } from './pages/PlatformModulesPage.tsx';
+import { BillingPage } from './pages/BillingPage.tsx';
+import { WaitingRoomDisplayPage } from './pages/WaitingRoomDisplayPage.tsx';
+import { CombinedReportsPage } from './pages/CombinedReportsPage.tsx';
+import { AccountsPage } from './pages/AccountsPage.tsx';
+import { PurchasingPage } from './pages/PurchasingPage.tsx';
+import { HrAdminPage } from './pages/HrAdminPage.tsx';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -29,7 +35,7 @@ function AuthenticatedRoutes() {
 
   if (!authReady) {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6 text-sm text-slate-600">
+      <div className="min-h-screen neon-canvas flex items-center justify-center p-6 text-sm neon-text-cyan">
         Loading session...
       </div>
     );
@@ -45,7 +51,7 @@ function AuthenticatedRoutes() {
 
   if (sessionLoading) {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6 text-sm text-slate-600">
+      <div className="min-h-screen neon-canvas flex items-center justify-center p-6 text-sm neon-text-cyan">
         Verifying workspace access...
       </div>
     );
@@ -53,14 +59,14 @@ function AuthenticatedRoutes() {
 
   if (sessionError) {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
-        <div className="bg-white border border-slate-200 rounded-xl p-6 max-w-md w-full space-y-4">
-          <h1 className="text-lg font-semibold text-slate-900">Unable to verify workspace access</h1>
-          <p className="text-sm text-slate-600">{sessionError.message}</p>
+      <div className="min-h-screen neon-canvas flex items-center justify-center p-6">
+        <div className="neon-card-glow rounded-2xl p-6 max-w-md w-full space-y-4">
+          <h1 className="text-lg font-semibold text-white">Unable to verify workspace access</h1>
+          <p className="text-sm text-slate-300">{sessionError.message}</p>
           <button
             type="button"
             onClick={() => refetchSession()}
-            className="min-h-[44px] px-4 bg-teal-700 text-white text-sm font-medium rounded-lg"
+            className="min-h-[44px] px-4 text-sm rounded-lg neon-btn-primary"
           >
             Retry
           </button>
@@ -74,20 +80,33 @@ function AuthenticatedRoutes() {
   }
 
   return (
-    <AppShell>
-      <Routes>
-        <Route path="/" element={<HomeAssistantPage />} />
-        <Route path="/today" element={<TodayBoardPage />} />
-        <Route path="/pharmacy/pos" element={<PharmacyPosPage />} />
-        <Route path="/pharmacy/catalogue" element={<PharmacyCataloguePage />} />
-        <Route path="/pharmacy/receiving" element={<PharmacyReceivingPage />} />
-        <Route path="/pharmacy/stock" element={<PharmacyStockPage />} />
-        <Route path="/modules" element={<PlatformModulesPage />} />
-        <Route path="/team" element={<TeamPage />} />
-        <Route path="/audit" element={<AuditPage />} />
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
-    </AppShell>
+    <Routes>
+      <Route path="/queue-display" element={<WaitingRoomDisplayPage />} />
+      <Route
+        path="*"
+        element={
+          <AppShell>
+            <Routes>
+              <Route path="/" element={<HomeAssistantPage />} />
+              <Route path="/today" element={<TodayBoardPage />} />
+              <Route path="/pharmacy/pos" element={<PharmacyPosPage />} />
+              <Route path="/pharmacy/catalogue" element={<PharmacyCataloguePage />} />
+              <Route path="/pharmacy/receiving" element={<PharmacyReceivingPage />} />
+              <Route path="/pharmacy/stock" element={<PharmacyStockPage />} />
+              <Route path="/purchasing" element={<PurchasingPage />} />
+              <Route path="/accounts" element={<AccountsPage />} />
+              <Route path="/hr-admin" element={<HrAdminPage />} />
+              <Route path="/reports" element={<CombinedReportsPage />} />
+              <Route path="/modules" element={<PlatformModulesPage />} />
+              <Route path="/billing" element={<BillingPage />} />
+              <Route path="/team" element={<TeamPage />} />
+              <Route path="/audit" element={<AuditPage />} />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Routes>
+          </AppShell>
+        }
+      />
+    </Routes>
   );
 }
 

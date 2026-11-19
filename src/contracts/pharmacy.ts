@@ -241,3 +241,152 @@ export const CreatePosReturnSchema = z.object({
     .max(50),
 });
 export type CreatePosReturnInput = z.infer<typeof CreatePosReturnSchema>;
+
+// 5. Pharmacy Alerts, Stocktake Reconciliation, Inter-Branch Transfers, Dispense Bridge & Z-Report
+export const CreateStocktakeSchema = z.object({
+  notes: z.string().trim().max(300).optional().default(''),
+});
+
+export const SubmitStocktakeCountsSchema = z.object({
+  counts: z
+    .array(
+      z.object({
+        lineId: z.string().min(4),
+        countedQtyBase: z.number().int().min(0).max(1000000),
+        reason: z.string().trim().max(200).optional().default(''),
+      })
+    )
+    .min(1),
+});
+
+export const CreateStockTransferSchema = z.object({
+  idempotencyKey: z.string().trim().min(8).max(120),
+  toBranchId: z.string().min(4),
+  notes: z.string().trim().max(300).optional().default(''),
+  lines: z
+    .array(
+      z.object({
+        productId: z.string().min(4),
+        lotId: z.string().min(4),
+        qtyBase: z.number().int().positive().max(1000000),
+      })
+    )
+    .min(1),
+});
+export type CreateStockTransferInput = z.infer<typeof CreateStockTransferSchema>;
+
+export const ReceiveStockTransferSchema = z.object({
+  receiveIntoSellable: z.boolean().default(false),
+  notes: z.string().trim().max(200).optional().default(''),
+});
+
+export const CreateDispenseOrderSchema = z.object({
+  personId: z.string().min(4),
+  appointmentId: z.string().optional().nullable(),
+  prescriberName: z.string().trim().min(2).max(140),
+  clinicalNotes: z.string().trim().max(400).optional().default(''),
+  lines: z
+    .array(
+      z.object({
+        productId: z.string().min(4),
+        packVariantId: z.string().min(4),
+        qtyPacks: z.number().int().positive().max(100),
+        dosageInstruction: z.string().trim().max(200).optional().default(''),
+      })
+    )
+    .min(1),
+});
+export type CreateDispenseOrderInput = z.infer<typeof CreateDispenseOrderSchema>;
+
+export interface StockAlertsDashboardResponse {
+  businessDate: string;
+  summary: {
+    expiredCount: number;
+    expiring30Count: number;
+    expiring60Count: number;
+    expiring90Count: number;
+    lowStockCount: number;
+    deadStockCount: number;
+  };
+  expiringLots: Array<{
+    lotId: string;
+    productId: string;
+    productName: string;
+    skuCode: string;
+    batchNumber: string;
+    manufacturer: string;
+    printedExpiry: string;
+    expiryCutoffDate: string | null;
+    daysUntilExpiry: number | null;
+    bucket: 'expired' | 'within_30d' | 'within_60d' | 'within_90d';
+    sellableOnHand: number;
+    baseUnit: string;
+    suggestedAction: string;
+  }>;
+  lowStockSkus: Array<{
+    productId: string;
+    skuCode: string;
+    productName: string;
+    manufacturer: string;
+    sellableOnHand: number;
+    reorderThreshold: number;
+    baseUnit: string;
+    suggestedOrderQty: number;
+  }>;
+  deadStockSkus: Array<{
+    productId: string;
+    skuCode: string;
+    productName: string;
+    sellableOnHand: number;
+    baseUnit: string;
+    daysSinceMovement: number;
+    suggestion: string;
+  }>;
+}
+
+export interface CombinedZReportResponse {
+  tenantName: string;
+  branchName: string;
+  businessDate: string;
+  currency: string;
+  modeFlags: {
+    hasClinic: boolean;
+    hasPharmacy: boolean;
+  };
+  clinic: {
+    appointmentCount: number;
+    completedCount: number;
+    grossReceiptsMinor: number;
+    voidedMinor: number;
+    netCollectionsMinor: number;
+    doctorPayoutsMinor: number;
+    clinicNetAfterPayoutMinor: number;
+  };
+  pharmacy: {
+    saleCount: number;
+    grossSalesMinor: number;
+    discountsMinor: number;
+    returnsMinor: number;
+    netSalesMinor: number;
+    estimatedCogsMinor: number;
+    grossProfitMinor: number;
+    supplierInvoicesMinor: number;
+    tillVarianceMinor: number;
+  };
+  expenses: {
+    expenseCount: number;
+    opexMinor: number;
+  };
+  combined: {
+    totalRevenueMinor: number;
+    totalRefundsAndVoidsMinor: number;
+    netOperatingCashflowMinor: number;
+    netProfitMinor: number;
+    byMethod: {
+      cashMinor: number;
+      cardMinor: number;
+      bankMinor: number;
+    };
+  };
+}
+

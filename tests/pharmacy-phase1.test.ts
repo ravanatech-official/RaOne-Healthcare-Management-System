@@ -2,7 +2,7 @@ import 'dotenv/config';
 import crypto from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { eq } from 'drizzle-orm';
-import { db } from '../src/db/index.ts';
+import { db, isDatabaseConfigured } from '../src/db/index.ts';
 import {
   costLayers,
   goodsReceiptLines,
@@ -80,9 +80,7 @@ describe('Unit Invariants: Product Modes, Safety Locks & Expiry Precision', () =
   });
 });
 
-const hasSqlEnv = Boolean(
-  process.env.SQL_HOST && process.env.SQL_USER && process.env.SQL_PASSWORD && process.env.SQL_DB_NAME
-);
+const hasSqlEnv = isDatabaseConfigured;
 
 describe.skipIf(!hasSqlEnv)('Pharmacy & Platform Phase 1 Integration Tests (Cloud SQL)', () => {
   const tag = crypto.randomBytes(4).toString('hex');

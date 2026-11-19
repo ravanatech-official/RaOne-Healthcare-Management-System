@@ -1,17 +1,23 @@
 import express from 'express';
+import { z } from 'zod';
 import {
   AddBarcodeAliasSchema,
   ApprovePosCartSchema,
   CheckoutPosSaleSchema,
   CloseTillShiftSchema,
+  CreateDispenseOrderSchema,
   CreatePackVariantSchema,
   CreatePosReturnSchema,
   CreateProductSchema,
+  CreateStocktakeSchema,
+  CreateStockTransferSchema,
   CreateSupplierSchema,
   LotQualityTransitionSchema,
   OpenTillShiftSchema,
   PostGoodsReceiptSchema,
   PostSupplierInvoiceSchema,
+  ReceiveStockTransferSchema,
+  SubmitStocktakeCountsSchema,
   TillCashEventSchema,
   UpdatePackConversionSchema,
 } from '../contracts/pharmacy.ts';
@@ -44,6 +50,19 @@ import {
   openTillShift,
   recordTillCashEvent,
 } from '../domain/pharmacy-pos.ts';
+import {
+  createDispenseOrder,
+  createStocktake,
+  createStockTransfer,
+  getPharmacyAlertsDashboard,
+  listDispenseOrders,
+  listStocktakes,
+  listStockTransfers,
+  reconcileStocktake,
+  receiveStockTransfer,
+  submitStocktakeCounts,
+  updateDispenseOrderStatus,
+} from '../domain/pharmacy-ops.ts';
 import { requireActiveWorkspace } from '../domain/tenancy.ts';
 import { type AuthRequest, requireAuth } from '../middleware/auth.ts';
 import { sendApiError } from './error-helper.ts';
@@ -463,6 +482,194 @@ pharmacyRouter.post('/pos/sales/:saleId/returns', async (req: AuthRequest, res) 
       correlationId
     );
     return res.status(201).json({ ...result, correlationId });
+  } catch (error) {
+    return sendApiError(res, error, correlationId);
+  }
+});
+
+// Phase 3: Alerts Dashboard, Stocktakes, Multi-Branch Transfers & Clinical Dispense Queue
+pharmacyRouter.get('/alerts', async (req: AuthRequest, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  const correlationId = req.correlationId!;
+  try {
+    const requestedTenantId = req.header('x-tenant-id') || undefined;
+    const context = await requireActiveWorkspace(req.authUser!, requestedTenantId);
+    const alerts = await getPharmacyAlertsDashboard(context);
+    return res.json({ ...alerts, correlationId });
+  } catch (error) {
+    return sendApiError(res, error, correlationId);
+  }
+});
+
+pharmacyRouter.get('/stocktakes', async (req: AuthRequest, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  const correlationId = req.correlationId!;
+  try {
+    const requestedTenantId = req.header('x-tenant-id') || undefined;
+    const context = await requireActiveWorkspace(req.authUser!, requestedTenantId);
+    const stocktakes = await listStocktakes(context);
+    return res.json({ stocktakes, correlationId });
+  } catch (error) {
+    return sendApiError(res, error, correlationId);
+  }
+});
+
+pharmacyRouter.post('/stocktakes', async (req: AuthRequest, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  const correlationId = req.correlationId!;
+  try {
+    const requestedTenantId = req.header('x-tenant-id') || undefined;
+    const context = await requireActiveWorkspace(req.authUser!, requestedTenantId);
+    const parsed = CreateStocktakeSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      throw new ValidationError('Invalid stocktake payload');
+    }
+    const created = await createStocktake(context, parsed.data.notes, correlationId);
+    return res.status(201).json({ ...created, correlationId });
+  } catch (error) {
+    return sendApiError(res, error, correlationId);
+  }
+});
+
+pharmacyRouter.post('/stocktakes/:id/counts', async (req: AuthRequest, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  const correlationId = req.correlationId!;
+  try {
+    const requestedTenantId = req.header('x-tenant-id') || undefined;
+    const context = await requireActiveWorkspace(req.authUser!, requestedTenantId);
+    const parsed = SubmitStocktakeCountsSchema.safeParse(req.body);
+    if (!parsed.success) {
+      throw new ValidationError(parsed.error.issues[0]?.message || 'Invalid stocktake counts');
+    }
+    const result = await submitStocktakeCounts(
+      context,
+      String(req.params.id),
+      parsed.data,
+      correlationId
+    );
+    return res.json({ ...result, correlationId });
+  } catch (error) {
+    return sendApiError(res, error, correlationId);
+  }
+});
+
+pharmacyRouter.post('/stocktakes/:id/reconcile', async (req: AuthRequest, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  const correlationId = req.correlationId!;
+  try {
+    const requestedTenantId = req.header('x-tenant-id') || undefined;
+    const context = await requireActiveWorkspace(req.authUser!, requestedTenantId);
+    const result = await reconcileStocktake(context, String(req.params.id), correlationId);
+    return res.json({ ...result, correlationId });
+  } catch (error) {
+    return sendApiError(res, error, correlationId);
+  }
+});
+
+pharmacyRouter.get('/transfers', async (req: AuthRequest, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  const correlationId = req.correlationId!;
+  try {
+    const requestedTenantId = req.header('x-tenant-id') || undefined;
+    const context = await requireActiveWorkspace(req.authUser!, requestedTenantId);
+    const transfers = await listStockTransfers(context);
+    return res.json({ transfers, correlationId });
+  } catch (error) {
+    return sendApiError(res, error, correlationId);
+  }
+});
+
+pharmacyRouter.post('/transfers', async (req: AuthRequest, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  const correlationId = req.correlationId!;
+  try {
+    const requestedTenantId = req.header('x-tenant-id') || undefined;
+    const context = await requireActiveWorkspace(req.authUser!, requestedTenantId);
+    const parsed = CreateStockTransferSchema.safeParse(req.body);
+    if (!parsed.success) {
+      throw new ValidationError(parsed.error.issues[0]?.message || 'Invalid stock transfer payload');
+    }
+    const result = await createStockTransfer(context, parsed.data, correlationId);
+    return res.status(201).json({ ...result, correlationId });
+  } catch (error) {
+    return sendApiError(res, error, correlationId);
+  }
+});
+
+pharmacyRouter.post('/transfers/:id/receive', async (req: AuthRequest, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  const correlationId = req.correlationId!;
+  try {
+    const requestedTenantId = req.header('x-tenant-id') || undefined;
+    const context = await requireActiveWorkspace(req.authUser!, requestedTenantId);
+    const parsed = ReceiveStockTransferSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      throw new ValidationError('Invalid transfer receive payload');
+    }
+    const result = await receiveStockTransfer(
+      context,
+      String(req.params.id),
+      parsed.data,
+      correlationId
+    );
+    return res.json({ ...result, correlationId });
+  } catch (error) {
+    return sendApiError(res, error, correlationId);
+  }
+});
+
+pharmacyRouter.get('/dispense-queue', async (req: AuthRequest, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  const correlationId = req.correlationId!;
+  try {
+    const requestedTenantId = req.header('x-tenant-id') || undefined;
+    const context = await requireActiveWorkspace(req.authUser!, requestedTenantId);
+    const orders = await listDispenseOrders(context);
+    return res.json({ orders, correlationId });
+  } catch (error) {
+    return sendApiError(res, error, correlationId);
+  }
+});
+
+pharmacyRouter.post('/dispense-queue', async (req: AuthRequest, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  const correlationId = req.correlationId!;
+  try {
+    const requestedTenantId = req.header('x-tenant-id') || undefined;
+    const context = await requireActiveWorkspace(req.authUser!, requestedTenantId);
+    const parsed = CreateDispenseOrderSchema.safeParse(req.body);
+    if (!parsed.success) {
+      throw new ValidationError(parsed.error.issues[0]?.message || 'Invalid dispense order payload');
+    }
+    const created = await createDispenseOrder(context, parsed.data, correlationId);
+    return res.status(201).json({ ...created, correlationId });
+  } catch (error) {
+    return sendApiError(res, error, correlationId);
+  }
+});
+
+pharmacyRouter.post('/dispense-queue/:id/status', async (req: AuthRequest, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  const correlationId = req.correlationId!;
+  try {
+    const requestedTenantId = req.header('x-tenant-id') || undefined;
+    const context = await requireActiveWorkspace(req.authUser!, requestedTenantId);
+    const schema = z.object({
+      status: z.enum(['dispensed', 'cancelled']),
+      posSaleId: z.string().nullable().optional().default(null),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      throw new ValidationError('Invalid dispense order status update');
+    }
+    const updated = await updateDispenseOrderStatus(
+      context,
+      String(req.params.id),
+      parsed.data.status,
+      parsed.data.posSaleId,
+      correlationId
+    );
+    return res.json({ ...updated, correlationId });
   } catch (error) {
     return sendApiError(res, error, correlationId);
   }

@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { and, asc, desc, eq, or, sql } from 'drizzle-orm';
-import { db } from '../db/index.ts';
+import { db, isDatabaseConfigured } from '../db/index.ts';
 import {
   auditEvents,
   commands,
@@ -32,7 +32,9 @@ import {
   NotFoundError,
   ValidationError,
 } from './errors.ts';
+import { addMemAuditEvent, getMemoryStore } from './memory-store.ts';
 import { computeBaseUnits } from './pharmacy-catalogue.ts';
+import { assertWorkspaceNotReadOnlyGrace } from './subscription-billing.ts';
 import {
   assertCapability,
   assertPermission,
@@ -116,6 +118,13 @@ export async function listSuppliers(context: ActiveWorkspaceContext) {
   assertCapability(context, 'pharmacy.receiving');
   assertPermission(context, 'pharmacy.catalogue.read');
 
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    return store.suppliers
+      .filter((s) => s.tenantId === context.tenantId && (!context.legalEntityId || s.legalEntityId === context.legalEntityId))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
   const clauses = [eq(suppliers.tenantId, context.tenantId)];
   if (context.legalEntityId) {
     clauses.push(eq(suppliers.legalEntityId, context.legalEntityId));
@@ -141,9 +150,39 @@ export async function createSupplier(
 ) {
   assertCapability(context, 'pharmacy.receiving');
   assertPermission(context, 'pharmacy.receiving.write');
+  await assertWorkspaceNotReadOnlyGrace(context.tenantId, context.timezone);
 
   if (!context.legalEntityId) {
     throw new ValidationError('Active legal entity is required to register suppliers');
+  }
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const created = {
+      id: crypto.randomUUID(),
+      tenantId: context.tenantId,
+      legalEntityId: context.legalEntityId,
+      name: input.name.trim(),
+      registrationRef: input.registrationRef?.trim() || '',
+      contactName: input.contactName?.trim() || '',
+      phone: input.phone?.trim() || '',
+      email: input.email?.trim() || '',
+      status: input.status,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    store.suppliers.push(created);
+    addMemAuditEvent({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'pharmacy.supplier_created',
+      entityType: 'supplier',
+      entityId: created.id,
+      correlationId,
+      metadataJson: { name: created.name, status: created.status },
+    });
+    return created;
   }
 
   return db.transaction(async (tx) => {
@@ -181,6 +220,13 @@ export async function listStorageLocations(context: ActiveWorkspaceContext) {
   assertCapability(context, 'pharmacy.inventory');
   assertPermission(context, 'pharmacy.stock.read');
 
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    return store.storageLocations
+      .filter((l) => l.tenantId === context.tenantId && l.branchId === context.branchId && l.active)
+      .sort((a, b) => a.code.localeCompare(b.code));
+  }
+
   return db
     .select()
     .from(storageLocations)
@@ -197,6 +243,25 @@ export async function listStorageLocations(context: ActiveWorkspaceContext) {
 export async function listGoodsReceipts(context: ActiveWorkspaceContext) {
   assertCapability(context, 'pharmacy.receiving');
   assertPermission(context, 'pharmacy.stock.read');
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    return store.goodsReceipts
+      .filter((g) => g.tenantId === context.tenantId && g.branchId === context.branchId)
+      .sort((a, b) => b.postedAt.getTime() - a.postedAt.getTime())
+      .slice(0, 50)
+      .map((g) => ({
+        id: g.id,
+        supplierId: g.supplierId,
+        supplierName: store.suppliers.find((s) => s.id === g.supplierId)?.name ?? 'Supplier',
+        supplierDocRef: g.supplierDocRef,
+        docType: g.docType,
+        receivedDate: g.receivedDate,
+        status: g.status,
+        notes: g.notes,
+        postedAt: g.postedAt,
+      }));
+  }
 
   const rows = await db
     .select({
@@ -230,6 +295,26 @@ export async function listGoodsReceipts(context: ActiveWorkspaceContext) {
 export async function listSupplierInvoices(context: ActiveWorkspaceContext) {
   assertCapability(context, 'pharmacy.receiving');
   assertPermission(context, 'pharmacy.stock.read');
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    return store.supplierInvoices
+      .filter((i) => i.tenantId === context.tenantId && i.branchId === context.branchId)
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+      .slice(0, 50)
+      .map((i) => ({
+        id: i.id,
+        supplierId: i.supplierId,
+        supplierName: store.suppliers.find((s) => s.id === i.supplierId)?.name ?? 'Supplier',
+        goodsReceiptId: i.goodsReceiptId,
+        invoiceNumber: i.invoiceNumber,
+        invoiceDate: i.invoiceDate,
+        totalMinor: i.totalMinor,
+        currency: i.currency,
+        status: i.status,
+        createdAt: i.createdAt,
+      }));
+  }
 
   return db
     .select({
@@ -266,6 +351,7 @@ export async function postGoodsReceipt(
 ) {
   assertCapability(context, 'pharmacy.receiving');
   assertPermission(context, 'pharmacy.receiving.write');
+  await assertWorkspaceNotReadOnlyGrace(context.tenantId, context.timezone);
 
   if (!context.legalEntityId) {
     throw new ValidationError('Active branch must belong to a legal entity before posting receipts');
@@ -279,6 +365,215 @@ export async function postGoodsReceipt(
     notes: input.notes.trim(),
     lines: input.lines,
   });
+
+  const businessDate = getBusinessDateInTimezone(context.timezone);
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const existingCmd = store.commands.find(
+      (c) =>
+        c.tenantId === context.tenantId &&
+        c.actorUserId === context.userId &&
+        c.commandType === 'pharmacy.grn.post' &&
+        c.idempotencyKey === input.idempotencyKey
+    );
+    if (existingCmd) {
+      if (existingCmd.payloadHash !== payloadHash) {
+        throw new ConflictError('Idempotency key already used with a different goods receipt payload', 'IDEMPOTENCY_CONFLICT');
+      }
+      if (existingCmd.state === 'committed' && existingCmd.resultJson) {
+        return { ...(existingCmd.resultJson as Record<string, unknown>), idempotentReplay: true };
+      }
+    }
+
+    const supplier = store.suppliers.find(
+      (s) => s.id === input.supplierId && s.tenantId === context.tenantId && s.legalEntityId === context.legalEntityId
+    );
+    if (!supplier) throw new NotFoundError('Supplier not found in active legal entity');
+    if (supplier.status === 'suspended') throw new ConflictError('Cannot post goods receipt for a suspended supplier');
+
+    if (store.goodsReceipts.some((g) => g.tenantId === context.tenantId && g.supplierId === supplier.id && g.supplierDocRef === input.supplierDocRef.trim())) {
+      throw new ConflictError(`Supplier document "${input.supplierDocRef}" has already been posted`, 'DUPLICATE_SUPPLIER_DOC');
+    }
+
+    const branchLocations = store.storageLocations.filter(
+      (l) => l.tenantId === context.tenantId && l.branchId === context.branchId && l.active
+    );
+    const defaultShelfLoc = branchLocations.find((l) => l.locationType === 'dispensary') ?? branchLocations[0];
+    const defaultQuarantineLoc = branchLocations.find((l) => l.locationType === 'quarantine') ?? defaultShelfLoc;
+    if (!defaultShelfLoc || !defaultQuarantineLoc) {
+      throw new ValidationError('No active storage locations configured for this branch');
+    }
+
+    const cmdId = crypto.randomUUID();
+    const now = new Date();
+    const grn = {
+      id: crypto.randomUUID(),
+      tenantId: context.tenantId,
+      legalEntityId: context.legalEntityId,
+      branchId: context.branchId,
+      supplierId: supplier.id,
+      supplierDocRef: input.supplierDocRef.trim(),
+      docType: input.docType,
+      receivedDate: input.receivedDate,
+      status: 'posted',
+      notes: input.notes.trim(),
+      commandId: cmdId,
+      createdByUserId: context.userId,
+      postedAt: now,
+      createdAt: now,
+    };
+
+    const lineSummaries: Array<{
+      lineId: string; lotId: string; productId: string; batchNumber: string;
+      uomConversionVersion: number; acceptedQtyBase: number; quarantinedQtyBase: number;
+      qualityStatus: string; unitCostMinor: number;
+    }> = [];
+    let cachedPharmacistGrantId: string | null = null;
+    const ops: Array<() => void> = [];
+
+    for (const line of input.lines) {
+      const totalPacks = line.receivedPacks + line.bonusPacks;
+      if (totalPacks <= 0) throw new ValidationError('Each receipt line must receive at least 1 paid or bonus pack');
+      const product = store.products.find(
+        (p) => p.id === line.productId && p.tenantId === context.tenantId && p.legalEntityId === context.legalEntityId
+      );
+      if (!product) throw new NotFoundError('Product SKU not found in active legal entity');
+      const variant = store.packVariants.find(
+        (v) => v.id === line.packVariantId && v.productId === product.id && v.tenantId === context.tenantId
+      );
+      if (!variant) throw new NotFoundError('Pack variant not found for product');
+      const conversion = store.uomConversions.find(
+        (c) => c.tenantId === context.tenantId && c.packVariantId === variant.id && c.version === variant.currentConversionVersion
+      );
+      if (!conversion) throw new ValidationError('Missing active UOM conversion snapshot for pack variant');
+
+      const manufacturer = line.manufacturer?.trim() || product.manufacturer;
+      const batchNumber = line.batchNumber.trim();
+      const activeRecall = store.recalls.find(
+        (r) => r.tenantId === context.tenantId && r.status === 'active' && (r.productId === product.id || r.manufacturer === manufacturer)
+      );
+      if (activeRecall) {
+        throw new ConflictError(`Active recall ${activeRecall.referenceCode} blocks receiving ${product.displayName}`, 'ACTIVE_RECALL_BLOCK');
+      }
+
+      const expiry = parseAndValidateExpiry(line.printedExpiry, line.expiryPrecision, businessDate);
+      const totalBaseQty = computeBaseUnits(totalPacks, conversion.baseQtyPerPack);
+      let acceptedQtyBase = 0;
+      let quarantinedQtyBase = totalBaseQty;
+      if (!(expiry.forceQuarantine || expiry.isExpired || line.condition !== 'good' || !line.releaseImmediately)) {
+        const qPacks = Math.min(totalPacks, line.quarantinedPacks);
+        quarantinedQtyBase = computeBaseUnits(qPacks, conversion.baseQtyPerPack);
+        acceptedQtyBase = totalBaseQty - quarantinedQtyBase;
+      }
+      if (acceptedQtyBase > 0 && product.requiresPharmacistRelease && !cachedPharmacistGrantId) {
+        cachedPharmacistGrantId = (await assertProfessionalGrant(context, 'pharmacist')).id;
+      }
+      const targetLocationId = line.storageLocationId
+        ? (() => {
+            const f = branchLocations.find((l) => l.id === line.storageLocationId);
+            if (!f) throw new NotFoundError('Specified storage location does not belong to active branch');
+            return f.id;
+          })()
+        : acceptedQtyBase > 0 ? defaultShelfLoc.id : defaultQuarantineLoc.id;
+
+      const existingLot = store.lots.find(
+        (l) => l.tenantId === context.tenantId && l.branchId === context.branchId && l.productId === product.id && l.manufacturer === manufacturer && l.batchNumber === batchNumber
+      );
+      if (existingLot && (existingLot.printedExpiry !== line.printedExpiry.trim() || existingLot.expiryPrecision !== line.expiryPrecision)) {
+        throw new ConflictError(`Batch "${batchNumber}" already exists with printed expiry "${existingLot.printedExpiry}"`, 'BATCH_EXPIRY_MISMATCH');
+      }
+
+      ops.push(() => {
+        let lotRecord = existingLot;
+        const desiredStatus: 'quarantine' | 'released' | 'blocked' = expiry.isExpired ? 'blocked' : acceptedQtyBase > 0 ? 'released' : 'quarantine';
+        if (lotRecord) {
+          if (acceptedQtyBase > 0 && lotRecord.qualityStatus === 'quarantine') {
+            lotRecord.qualityStatus = 'released';
+            lotRecord.releasedByGrantId = cachedPharmacistGrantId;
+            lotRecord.releasedAt = now;
+            lotRecord.updatedAt = now;
+          }
+        } else {
+          lotRecord = {
+            id: crypto.randomUUID(), tenantId: context.tenantId, branchId: context.branchId, productId: product.id, manufacturer, batchNumber,
+            printedExpiry: expiry.forceQuarantine ? 'UNKNOWN' : line.printedExpiry.trim(),
+            expiryPrecision: line.expiryPrecision, expiryCutoffDate: expiry.expiryCutoffDate, qualityStatus: desiredStatus,
+            quarantineReason: expiry.forceQuarantine ? 'Unknown printed expiry' : expiry.isExpired ? 'Expired on receipt' : line.condition !== 'good' ? `Condition: ${line.condition}` : acceptedQtyBase === 0 ? 'Awaiting pharmacist release' : '',
+            releasedByGrantId: acceptedQtyBase > 0 ? cachedPharmacistGrantId : null, releasedAt: acceptedQtyBase > 0 ? now : null,
+            createdAt: now, updatedAt: now,
+          };
+          store.lots.push(lotRecord);
+        }
+        const totalLineCostMinor = line.receivedPacks * line.unitPackCostMinor;
+        const unitCostMinor = totalBaseQty > 0 ? Math.round(totalLineCostMinor / totalBaseQty) : 0;
+        const grnLineId = crypto.randomUUID();
+        store.goodsReceiptLines.push({
+          id: grnLineId, tenantId: context.tenantId, goodsReceiptId: grn.id, productId: product.id, packVariantId: variant.id,
+          uomConversionVersion: conversion.version, lotId: lotRecord.id, storageLocationId: targetLocationId,
+          orderedPacks: line.orderedPacks, receivedPacks: line.receivedPacks, bonusPacks: line.bonusPacks,
+          acceptedQtyBase, quarantinedQtyBase, unitPackCostMinor: line.unitPackCostMinor, totalLineCostMinor,
+          isProvisionalCost: line.isProvisionalCost, condition: expiry.forceQuarantine ? 'unknown_expiry' : line.condition, createdAt: now,
+        });
+        const costLayerId = crypto.randomUUID();
+        store.costLayers.push({
+          id: costLayerId, tenantId: context.tenantId, branchId: context.branchId, productId: product.id, lotId: lotRecord.id,
+          goodsReceiptLineId: grnLineId, unitCostMinor, totalCostMinor: totalLineCostMinor,
+          initialQtyBase: totalBaseQty, remainingQtyBase: totalBaseQty, isProvisional: line.isProvisionalCost, receivedAt: now, createdAt: now,
+        });
+        const addSellable = acceptedQtyBase;
+        const addExpired = expiry.isExpired ? quarantinedQtyBase : 0;
+        const addQuarantine = expiry.isExpired ? 0 : quarantinedQtyBase;
+        const bal = store.inventoryBalances.find(
+          (b) => b.tenantId === context.tenantId && b.branchId === context.branchId && b.locationId === targetLocationId && b.productId === product.id && b.lotId === lotRecord!.id
+        );
+        if (bal) {
+          bal.sellableOnHand += addSellable; bal.quarantineQty += addQuarantine; bal.expiredQty += addExpired; bal.version += 1; bal.updatedAt = now;
+        } else {
+          store.inventoryBalances.push({
+            id: crypto.randomUUID(), tenantId: context.tenantId, branchId: context.branchId, locationId: targetLocationId, productId: product.id, lotId: lotRecord.id,
+            sellableOnHand: addSellable, reservedQty: 0, quarantineQty: addQuarantine, returnedQuarantineQty: 0, damagedQty: 0, expiredQty: addExpired, recalledQty: 0, disposedQty: 0, version: 1, updatedAt: now,
+          });
+        }
+        const movementType = input.docType === 'opening_balance' ? 'opening_balance' : 'grn_receive';
+        if (addSellable > 0) {
+          store.stockMovements.push({
+            id: crypto.randomUUID(), tenantId: context.tenantId, branchId: context.branchId, locationId: targetLocationId, productId: product.id, lotId: lotRecord.id, costLayerId,
+            movementType, qtyBase: addSellable, fromBucket: 'external_supplier', toBucket: 'sellable', reason: `GRN ${input.supplierDocRef} accepted`,
+            sourceDocType: input.docType, sourceDocId: grn.id, commandId: cmdId, packVariantId: variant.id, uomConversionVersion: conversion.version, actorUserId: context.userId, occurredAt: now, createdAt: now,
+          });
+        }
+        if (addQuarantine > 0 || addExpired > 0) {
+          store.stockMovements.push({
+            id: crypto.randomUUID(), tenantId: context.tenantId, branchId: context.branchId, locationId: targetLocationId, productId: product.id, lotId: lotRecord.id, costLayerId,
+            movementType, qtyBase: addExpired > 0 ? addExpired : addQuarantine, fromBucket: 'external_supplier', toBucket: addExpired > 0 ? 'expired' : 'quarantine',
+            reason: expiry.forceQuarantine ? 'Unknown printed expiry' : expiry.isExpired ? 'Expired' : 'Quarantine hold',
+            sourceDocType: input.docType, sourceDocId: grn.id, commandId: cmdId, packVariantId: variant.id, uomConversionVersion: conversion.version, actorUserId: context.userId, occurredAt: now, createdAt: now,
+          });
+        }
+        lineSummaries.push({
+          lineId: grnLineId, lotId: lotRecord.id, productId: product.id, batchNumber: lotRecord.batchNumber,
+          uomConversionVersion: conversion.version, acceptedQtyBase, quarantinedQtyBase, qualityStatus: lotRecord.qualityStatus, unitCostMinor,
+        });
+      });
+    }
+    store.goodsReceipts.push(grn);
+    ops.forEach((op) => op());
+    const responsePayload = {
+      goodsReceipt: { id: grn.id, supplierId: grn.supplierId, supplierDocRef: grn.supplierDocRef, docType: grn.docType, receivedDate: grn.receivedDate, status: grn.status },
+      lines: lineSummaries, idempotentReplay: false,
+    };
+    store.commands.push({
+      id: cmdId, tenantId: context.tenantId, actorUserId: context.userId, commandType: 'pharmacy.grn.post',
+      idempotencyKey: input.idempotencyKey, payloadHash, proposalId: null, state: 'committed', resultJson: responsePayload, committedAt: now,
+    });
+    addMemAuditEvent({
+      tenantId: context.tenantId, actorUserId: context.userId, actorUid: context.uid,
+      action: 'pharmacy.goods_receipt_posted', entityType: 'goods_receipt', entityId: grn.id, correlationId,
+      metadataJson: { supplierDocRef: grn.supplierDocRef, lineCount: lineSummaries.length },
+    });
+    return responsePayload;
+  }
 
   // Fast idempotent replay check before running writes
   const [existingCmd] = await db
@@ -308,8 +603,6 @@ export async function postGoodsReceipt(
       };
     }
   }
-
-  const businessDate = getBusinessDateInTimezone(context.timezone);
 
   return db.transaction(async (tx) => {
     const [cmd] = await tx
@@ -829,6 +1122,7 @@ export async function postSupplierInvoice(
 ) {
   assertCapability(context, 'pharmacy.receiving');
   assertPermission(context, 'pharmacy.invoice.write');
+  await assertWorkspaceNotReadOnlyGrace(context.tenantId, context.timezone);
 
   if (!context.legalEntityId) {
     throw new ValidationError('Active branch must belong to a legal entity');
@@ -841,6 +1135,45 @@ export async function postSupplierInvoice(
     invoiceDate: input.invoiceDate,
     totalMinor: input.totalMinor,
   });
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const existingCmd = store.commands.find(
+      (c) => c.tenantId === context.tenantId && c.actorUserId === context.userId && c.commandType === 'pharmacy.supplier_invoice.post' && c.idempotencyKey === input.idempotencyKey
+    );
+    if (existingCmd) {
+      if (existingCmd.payloadHash !== payloadHash) throw new ConflictError('Idempotency key already used with a different invoice payload');
+      if (existingCmd.state === 'committed' && existingCmd.resultJson) return { ...(existingCmd.resultJson as Record<string, unknown>), idempotentReplay: true };
+    }
+    const supplier = store.suppliers.find((s) => s.id === input.supplierId && s.tenantId === context.tenantId && s.legalEntityId === context.legalEntityId);
+    if (!supplier) throw new NotFoundError('Supplier not found in active legal entity');
+    if (input.goodsReceiptId && !store.goodsReceipts.some((g) => g.id === input.goodsReceiptId && g.tenantId === context.tenantId && g.supplierId === supplier.id)) {
+      throw new NotFoundError('Linked goods receipt not found for supplier');
+    }
+    if (store.supplierInvoices.some((i) => i.tenantId === context.tenantId && i.supplierId === supplier.id && i.invoiceNumber === input.invoiceNumber.trim())) {
+      throw new ConflictError(`Invoice number "${input.invoiceNumber}" already exists for supplier`);
+    }
+    const cmdId = crypto.randomUUID();
+    const now = new Date();
+    const invoice = {
+      id: crypto.randomUUID(), tenantId: context.tenantId, legalEntityId: context.legalEntityId, branchId: context.branchId,
+      supplierId: supplier.id, goodsReceiptId: input.goodsReceiptId ?? null, invoiceNumber: input.invoiceNumber.trim(),
+      invoiceDate: input.invoiceDate, totalMinor: input.totalMinor, currency: context.currency, status: 'posted',
+      commandId: cmdId, createdByUserId: context.userId, createdAt: now,
+    };
+    store.supplierInvoices.push(invoice);
+    const responsePayload = { invoice, stockImpact: 'none', idempotentReplay: false };
+    store.commands.push({
+      id: cmdId, tenantId: context.tenantId, actorUserId: context.userId, commandType: 'pharmacy.supplier_invoice.post',
+      idempotencyKey: input.idempotencyKey, payloadHash, proposalId: null, state: 'committed', resultJson: responsePayload, committedAt: now,
+    });
+    addMemAuditEvent({
+      tenantId: context.tenantId, actorUserId: context.userId, actorUid: context.uid,
+      action: 'pharmacy.supplier_invoice_posted', entityType: 'supplier_invoice', entityId: invoice.id, correlationId,
+      metadataJson: { invoiceNumber: invoice.invoiceNumber, stockImpact: 'none' },
+    });
+    return responsePayload;
+  }
 
   const [existingCmd] = await db
     .select()
@@ -996,8 +1329,89 @@ export async function transitionLotQuality(
   correlationId: string
 ) {
   assertCapability(context, 'pharmacy.inventory');
+  await assertWorkspaceNotReadOnlyGrace(context.tenantId, context.timezone);
 
   const businessDate = getBusinessDateInTimezone(context.timezone);
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const lot = store.lots.find((l) => l.id === lotId && l.tenantId === context.tenantId && l.branchId === context.branchId);
+    if (!lot) throw new NotFoundError('Lot not found in active branch');
+
+    if (input.action === 'release_to_sellable') {
+      const grant = await assertProfessionalGrant(context, 'pharmacist');
+      if (lot.expiryPrecision === 'unknown' || !lot.expiryCutoffDate) {
+        throw new ConflictError('Lot with unknown expiry cannot be released to sellable inventory', 'UNKNOWN_EXPIRY_QUARANTINED');
+      }
+      if (lot.expiryCutoffDate < businessDate) {
+        throw new ConflictError(`Lot expired on ${lot.expiryCutoffDate} and cannot be released to sellable inventory`, 'EXPIRED_LOT_BLOCKED');
+      }
+      const activeRecall = store.recalls.find(
+        (r) => r.tenantId === context.tenantId && r.status === 'active' && (r.lotId === lot.id || r.productId === lot.productId || r.manufacturer === lot.manufacturer)
+      );
+      if (activeRecall) throw new ConflictError(`Active recall ${activeRecall.referenceCode} prevents release of this lot`, 'ACTIVE_RECALL_BLOCK');
+
+      const balances = store.inventoryBalances.filter(
+        (b) => b.tenantId === context.tenantId && b.branchId === context.branchId && b.lotId === lot.id && (!input.locationId || b.locationId === input.locationId)
+      );
+      let totalReleased = 0;
+      const now = new Date();
+      for (const bal of balances) {
+        if (bal.quarantineQty <= 0) continue;
+        const moveQty = input.qtyBase ? Math.min(bal.quarantineQty, input.qtyBase - totalReleased) : bal.quarantineQty;
+        if (moveQty <= 0) continue;
+        bal.quarantineQty -= moveQty; bal.sellableOnHand += moveQty; bal.version += 1; bal.updatedAt = now;
+        store.stockMovements.push({
+          id: crypto.randomUUID(), tenantId: context.tenantId, branchId: context.branchId, locationId: bal.locationId, productId: lot.productId, lotId: lot.id, costLayerId: null,
+          movementType: 'quality_release', qtyBase: moveQty, fromBucket: 'quarantine', toBucket: 'sellable', reason: input.reason.trim(),
+          sourceDocType: 'quality_release', sourceDocId: lot.id, commandId: null, packVariantId: null, uomConversionVersion: null, actorUserId: context.userId, occurredAt: now, createdAt: now,
+        });
+        totalReleased += moveQty;
+      }
+      if (totalReleased <= 0) throw new ValidationError('No quarantined balance available on this lot to release');
+      lot.qualityStatus = 'released'; lot.releasedByGrantId = grant.id; lot.releasedAt = now; lot.updatedAt = now;
+      addMemAuditEvent({
+        tenantId: context.tenantId, actorUserId: context.userId, actorUid: context.uid,
+        action: 'pharmacy.lot_released_to_sellable', entityType: 'lot', entityId: lot.id, correlationId,
+        metadataJson: { releasedByGrantId: grant.id, qtyBaseReleased: totalReleased },
+      });
+      return { lot, releasedByGrantId: grant.id, qtyBaseReleased: totalReleased };
+    }
+
+    assertPermission(context, 'pharmacy.lot.quarantine_place');
+    const balances = store.inventoryBalances.filter(
+      (b) => b.tenantId === context.tenantId && b.branchId === context.branchId && b.lotId === lot.id && (!input.locationId || b.locationId === input.locationId)
+    );
+    let totalMoved = 0;
+    const isRecall = input.action === 'place_recall_hold';
+    const now = new Date();
+    for (const bal of balances) {
+      if (bal.sellableOnHand <= 0) continue;
+      const moveQty = bal.sellableOnHand;
+      bal.sellableOnHand = 0; bal.reservedQty = 0;
+      if (isRecall) bal.recalledQty += moveQty; else bal.quarantineQty += moveQty;
+      bal.version += 1; bal.updatedAt = now;
+      store.stockMovements.push({
+        id: crypto.randomUUID(), tenantId: context.tenantId, branchId: context.branchId, locationId: bal.locationId, productId: lot.productId, lotId: lot.id, costLayerId: null,
+        movementType: isRecall ? 'recall_block' : 'quarantine_hold', qtyBase: moveQty, fromBucket: 'sellable', toBucket: isRecall ? 'recalled' : 'quarantine', reason: input.reason.trim(),
+        sourceDocType: isRecall ? 'recall' : 'quality_hold', sourceDocId: lot.id, commandId: null, packVariantId: null, uomConversionVersion: null, actorUserId: context.userId, occurredAt: now, createdAt: now,
+      });
+      totalMoved += moveQty;
+    }
+    lot.qualityStatus = isRecall ? 'blocked' : 'quarantine'; lot.quarantineReason = input.reason.trim(); lot.updatedAt = now;
+    if (isRecall) {
+      store.recalls.push({
+        id: crypto.randomUUID(), tenantId: context.tenantId, scopeType: 'lot', productId: lot.productId, lotId: lot.id,
+        manufacturer: lot.manufacturer, referenceCode: `REC-${lot.batchNumber}`, reason: input.reason.trim(), status: 'active', effectiveAt: now, activatedByUserId: context.userId, createdAt: now,
+      });
+    }
+    addMemAuditEvent({
+      tenantId: context.tenantId, actorUserId: context.userId, actorUid: context.uid,
+      action: isRecall ? 'pharmacy.lot_recall_blocked' : 'pharmacy.lot_quarantined', entityType: 'lot', entityId: lot.id, correlationId,
+      metadataJson: { qtyBaseMoved: totalMoved, reason: input.reason.trim() },
+    });
+    return { lot, qtyBaseHeld: totalMoved };
+  }
 
   if (input.action === 'release_to_sellable') {
     // Owner / Admin membership does NOT bypass active pharmacist grant (U11 / P10)
@@ -1305,6 +1719,41 @@ export async function transitionLotQuality(
 export async function getStockAndLotSummary(context: ActiveWorkspaceContext) {
   assertCapability(context, 'pharmacy.inventory');
   assertPermission(context, 'pharmacy.stock.read');
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    const balances = store.inventoryBalances
+      .filter((b) => b.tenantId === context.tenantId && b.branchId === context.branchId)
+      .map((b) => {
+        const loc = store.storageLocations.find((l) => l.id === b.locationId);
+        const prod = store.products.find((p) => p.id === b.productId);
+        const lot = store.lots.find((l) => l.id === b.lotId);
+        return {
+          balanceId: b.id, locationId: b.locationId, locationCode: loc?.code ?? '', locationName: loc?.name ?? 'Storage', locationType: loc?.locationType ?? 'dispensary',
+          productId: b.productId, skuCode: prod?.skuCode ?? '', productName: prod?.displayName ?? 'Product', genericName: prod?.genericName ?? '',
+          strengthValue: prod?.strengthValue ?? '', strengthUnit: prod?.strengthUnit ?? '', dosageForm: prod?.dosageForm ?? 'tablet',
+          regulatoryClass: prod?.regulatoryClass ?? 'otc', requiresPharmacistRelease: prod?.requiresPharmacistRelease ?? false, baseUnit: prod?.baseUnit ?? 'unit',
+          lotId: b.lotId, batchNumber: lot?.batchNumber ?? '', manufacturer: lot?.manufacturer ?? '', printedExpiry: lot?.printedExpiry ?? '',
+          expiryPrecision: lot?.expiryPrecision ?? 'day', expiryCutoffDate: lot?.expiryCutoffDate ?? null, qualityStatus: lot?.qualityStatus ?? 'quarantine',
+          quarantineReason: lot?.quarantineReason ?? '', releasedByGrantId: lot?.releasedByGrantId ?? null,
+          sellableOnHand: b.sellableOnHand, reservedQty: b.reservedQty, quarantineQty: b.quarantineQty, returnedQuarantineQty: b.returnedQuarantineQty,
+          damagedQty: b.damagedQty, expiredQty: b.expiredQty, recalledQty: b.recalledQty, disposedQty: b.disposedQty,
+          availableQty: Math.max(0, b.sellableOnHand - b.reservedQty),
+        };
+      })
+      .sort((a, b) => a.productName.localeCompare(b.productName) || (a.expiryCutoffDate || '9999-12-31').localeCompare(b.expiryCutoffDate || '9999-12-31'));
+
+    const recentMovements = store.stockMovements
+      .filter((m) => m.tenantId === context.tenantId && m.branchId === context.branchId)
+      .sort((a, b) => b.occurredAt.getTime() - a.occurredAt.getTime())
+      .slice(0, 50)
+      .map((m) => ({
+        id: m.id, productId: m.productId, productName: store.products.find((p) => p.id === m.productId)?.displayName ?? 'Product',
+        lotId: m.lotId, batchNumber: store.lots.find((l) => l.id === m.lotId)?.batchNumber ?? '', movementType: m.movementType, qtyBase: m.qtyBase,
+        fromBucket: m.fromBucket, toBucket: m.toBucket, reason: m.reason, sourceDocType: m.sourceDocType, uomConversionVersion: m.uomConversionVersion, occurredAt: m.occurredAt,
+      }));
+    return { balances, recentMovements };
+  }
 
   const balanceRows = await db
     .select({
