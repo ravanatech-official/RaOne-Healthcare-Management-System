@@ -1,0 +1,6 @@
+{
+  "name": "SuwaSeva — Conversational Clinic Workspace",
+  "description": "Voice-first and manual administrative workspace for Sri Lanka clinics: appointments, attendance, recorded collections, and deterministic daily reports.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
