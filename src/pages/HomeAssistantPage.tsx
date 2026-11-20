@@ -8,6 +8,7 @@ import {
   FileBarChart2,
   Package,
   Receipt,
+  ShieldCheck,
   ShoppingCart,
   Truck,
   Users,
@@ -62,6 +63,22 @@ export function HomeAssistantPage() {
 
       {/* Capability-Aware Operational Cards */}
       <section className="grid md:grid-cols-2 lg:grid-cols-3 gap-5">
+        <Link
+          to="/autopilot"
+          className="neon-card-glow hover:border-cyan-400/70 rounded-xl p-6 flex items-center justify-between gap-4 transition-all"
+        >
+          <div className="space-y-1.5">
+            <div className="flex items-center gap-2 neon-text-cyan font-semibold text-base">
+              <ShieldCheck className="w-5 h-5" aria-hidden="true" />
+              <span>{t('nav.autopilot')} &amp; Shift SOP</span>
+            </div>
+            <p className="text-sm text-slate-300 line-clamp-2">
+              Opening/Closing SOP checklists, Anti-Fraud Alerts, Smart Auto-Reorder &amp; Patient QR Kiosk
+            </p>
+          </div>
+          <ArrowRight className="w-5 h-5 text-cyan-400/70 shrink-0" aria-hidden="true" />
+        </Link>
+
         {hasClinic && (
           <>
             <Link

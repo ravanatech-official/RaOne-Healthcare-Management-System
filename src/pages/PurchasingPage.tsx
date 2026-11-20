@@ -8,6 +8,7 @@ import {
   PackagePlus,
   Printer,
   ShoppingCart,
+  Sparkles,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../context/AuthContext.tsx';
@@ -191,6 +192,25 @@ export function PurchasingPage() {
     },
   });
 
+  const autoDraftMutation = useMutation({
+    mutationFn: () => apiClient.generateAutoDraftPos(activeTenantId!),
+    onSuccess: async (res) => {
+      setErrorMsg(null);
+      setSuccessMsg(
+        res.createdCount > 0
+          ? `Velocity Engine generated ${res.createdCount} supplier-grouped Draft Purchase Order(s).`
+          : 'All SKUs are currently above their configured Reorder Points.'
+      );
+      await invalidateAll();
+    },
+    onError: (err) => {
+      setSuccessMsg(null);
+      setErrorMsg(
+        err instanceof Error ? err.message : 'Unable to auto-generate draft purchase orders.'
+      );
+    },
+  });
+
   const overview = purchasingQuery.data?.overview;
   const lowStockAlerts = alertsQuery.data?.lowStockSkus ?? [];
 
@@ -282,8 +302,25 @@ export function PurchasingPage() {
           {/* Low Stock Quick-Draft Strip */}
           {lowStockAlerts.length > 0 && (
             <section className="neon-card rounded-xl p-4 space-y-2.5 border-amber-400/40 no-print">
-              <div className="text-xs font-semibold text-amber-300">
-                Low-Stock Alert Reorder Suggestions ({lowStockAlerts.length})
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-xs font-semibold text-amber-300">
+                  Low-Stock Alert Reorder Suggestions ({lowStockAlerts.length})
+                </div>
+                {canManagePurchasing && (
+                  <button
+                    type="button"
+                    disabled={autoDraftMutation.isPending}
+                    onClick={() => autoDraftMutation.mutate()}
+                    className="min-h-[34px] px-3 rounded-lg text-xs font-semibold neon-btn-primary inline-flex items-center gap-1.5"
+                  >
+                    <Sparkles className="w-3.5 h-3.5" aria-hidden="true" />
+                    <span>
+                      {autoDraftMutation.isPending
+                        ? 'Drafting POs...'
+                        : '1-Click Auto-Draft POs (Velocity Engine)'}
+                    </span>
+                  </button>
+                )}
               </div>
               <div className="flex flex-wrap gap-2">
                 {lowStockAlerts.slice(0, 6).map((item) => (

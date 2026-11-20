@@ -1,13 +1,73 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { AlertTriangle, HelpCircle, Lock, LogOut, Sparkles, X } from 'lucide-react';
+import { AlertTriangle, CheckSquare, HelpCircle, Lock, LogOut, Sparkles, Square, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../context/AuthContext.tsx';
 import { apiClient } from '../lib/api-client.ts';
 import type { SupportedLocale } from '../contracts/api.ts';
 import { OfflineIndicator } from './OfflineIndicator.tsx';
 import { PWAInstallButton } from './PWAInstallButton.tsx';
+
+function getDay1TrainingSteps(role: string, isSi: boolean): Array<{ key: string; label: string }> {
+  const common = [
+    {
+      key: 'pin_clock',
+      label: isSi
+        ? '1. වැඩ ආරම්භයේදී HR අංශයෙන් Shift PIN එකෙන් Clock-In වී Opening SOP Checklist සම්පූර්ණ කරන්න.'
+        : '1. Clock-in via HR Shift PIN at shift start & complete the Opening SOP Checklist.',
+    },
+  ];
+  if (role === 'cashier' || role === 'pharmacist') {
+    return [
+      ...common,
+      {
+        key: 'till_fefo',
+        label: isSi
+          ? '2. POS Till Shift විවෘත කර FEFO අනුපිළිවෙලට බෙහෙත් නිකුත් කරන්න (වට්ටම් සීමාව ඉක්මවුවහොත් Owner PIN ලබා ගන්න).'
+          : '2. Open POS Till Shift, dispense by FEFO, and request Owner PIN for discounts above limit.',
+      },
+      {
+        key: 'blind_close',
+        label: isSi
+          ? '3. වැඩ අවසානයේ මුදල් ගණන් කර Blind Till Close හා Closing SOP Sign-Off සම්පූර්ණ කරන්න.'
+          : '3. Perform Blind Till Close with physical cash count and submit Closing SOP Sign-Off.',
+      },
+    ];
+  }
+  if (role === 'receptionist') {
+    return [
+      ...common,
+      {
+        key: 'kiosk_queue',
+        label: isSi
+          ? '2. රෝගීන්ට QR Self Check-In භාවිතය හෝ Today පුවරුවේ Token ලබා දීම තහවුරු කරන්න.'
+          : '2. Verify Patient QR Self Check-In kiosk or issue tokens cleanly on Today Board.',
+      },
+      {
+        key: 'handoff_note',
+        label: isSi
+          ? '3. ඊළඟ සේවකයා වෙනුවෙන් Closing Shift Handover සටහන ලියා භාර දෙන්න.'
+          : '3. Record a clear Shift Handover Note before locking or ending your shift.',
+      },
+    ];
+  }
+  return [
+    ...common,
+    {
+      key: 'governance_rules',
+      label: isSi
+        ? '2. Autopilot Cockpit හි Anti-Fraud PIN සීමාවන් සහ Auto-Reorder Par මට්ටම් පරීක්ෂා කරන්න.'
+        : '2. Review Maker-Checker PIN limits & Smart Reorder Par rules in the Autopilot Cockpit.',
+    },
+    {
+      key: 'briefing_closing',
+      label: isSi
+        ? '3. සවස Closing SOP පරීක්ෂාව සහ දෛනික Owner Briefing (WhatsApp/App) සමාලෝචනය කරන්න.'
+        : '3. Complete evening Closing SOP check and review the Daily Owner Briefing.',
+    },
+  ];
+}
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const { t, i18n } = useTranslation();
@@ -17,6 +77,29 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   const currentLocale = (i18n.language === 'en-LK' ? 'en-LK' : 'si-LK') as SupportedLocale;
   const workspace = session?.workspace;
+  const trainingRoleKey = `suwaseva_day1_training_${workspace?.role ?? 'staff'}`;
+  const [checkedSteps, setCheckedSteps] = useState<Record<string, boolean>>({});
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(trainingRoleKey);
+      setCheckedSteps(raw ? (JSON.parse(raw) as Record<string, boolean>) : {});
+    } catch {
+      setCheckedSteps({});
+    }
+  }, [trainingRoleKey]);
+
+  const toggleTrainingStep = (key: string) => {
+    setCheckedSteps((prev) => {
+      const next = { ...prev, [key]: !prev[key] };
+      try {
+        localStorage.setItem(trainingRoleKey, JSON.stringify(next));
+      } catch {
+        // Ignore storage quota errors
+      }
+      return next;
+    });
+  };
   const canViewReports =
     (workspace?.permissions.includes('reports.branch_summary') ||
       workspace?.permissions.includes('reports.all_financials')) ??
@@ -59,6 +142,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   const navItems = [
     { to: '/', label: t('nav.home') },
+    { to: '/autopilot', label: t('nav.autopilot') },
     ...(hasClinic ? [{ to: '/today', label: t('nav.today') }] : []),
     ...(hasPos ? [{ to: '/pharmacy/pos', label: t('nav.pos') }] : []),
     ...(hasCatalogue ? [{ to: '/pharmacy/catalogue', label: t('nav.catalogue') }] : []),
@@ -313,6 +397,38 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                     </li>
                   ))}
               </ul>
+            </div>
+
+            <div className="space-y-2.5 pt-2 border-t border-cyan-500/20">
+              <p className="text-sm font-semibold neon-text-cyan">
+                {currentLocale === 'si-LK'
+                  ? `Day-1 පුහුණු පිරික්සුම් ලැයිස්තුව (${workspace?.role ?? 'staff'})`
+                  : `Day-1 Guided Staff Onboarding SOP (${workspace?.role ?? 'staff'})`}
+              </p>
+              <div className="space-y-2">
+                {getDay1TrainingSteps(workspace?.role ?? 'staff', currentLocale === 'si-LK').map((step) => {
+                  const done = Boolean(checkedSteps[step.key]);
+                  return (
+                    <button
+                      key={step.key}
+                      type="button"
+                      onClick={() => toggleTrainingStep(step.key)}
+                      className={`w-full text-left p-2.5 rounded-lg border text-xs flex items-start gap-2.5 transition-colors ${
+                        done
+                          ? 'bg-emerald-950/35 border-emerald-400/40 text-emerald-100'
+                          : 'bg-[#040e22]/90 border-cyan-500/20 text-slate-200 hover:border-cyan-400/50'
+                      }`}
+                    >
+                      {done ? (
+                        <CheckSquare className="w-4 h-4 text-emerald-300 shrink-0 mt-0.5" aria-hidden="true" />
+                      ) : (
+                        <Square className="w-4 h-4 text-cyan-400/70 shrink-0 mt-0.5" aria-hidden="true" />
+                      )}
+                      <span className={done ? 'line-through opacity-80' : ''}>{step.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
             </div>
 
             <p className="text-xs text-slate-400 leading-relaxed">{t('help.boundaryNote')}</p>

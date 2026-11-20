@@ -18,6 +18,7 @@ import type {
   RecordOperatingExpenseInput,
   RecordSupplierPaymentInput,
 } from '../contracts/departments.ts';
+import { assertGovernancePinIfRequired } from './autopilot-ops.ts';
 import { NotFoundError, ValidationError } from './errors.ts';
 import { addMemAuditEvent, getMemoryStore } from './memory-store.ts';
 import { getCombinedZReport } from './pharmacy-ops.ts';
@@ -406,6 +407,16 @@ export async function recordOperatingExpense(
   const expenseDate = input.expenseDate || getBusinessDateInTimezone(context.timezone);
   const amountMinor = Math.round(input.amountLkr * 100);
 
+  await assertGovernancePinIfRequired(
+    context,
+    {
+      type: 'opex',
+      amountMinor,
+      managerOverridePin: input.managerOverridePin,
+    },
+    correlationId
+  );
+
   if (!isDatabaseConfigured) {
     const store = getMemoryStore();
     const record = {
@@ -501,6 +512,16 @@ export async function voidOperatingExpense(
     .where(and(eq(operatingExpenses.id, expenseId), eq(operatingExpenses.tenantId, context.tenantId)))
     .returning();
   if (!updated) throw new NotFoundError('Operating expense not found');
+  await db.insert(auditEvents).values({
+    tenantId: context.tenantId,
+    actorUserId: context.userId,
+    actorUid: context.uid,
+    action: 'accounts.expense_voided',
+    entityType: 'operating_expense',
+    entityId: expenseId,
+    inputSource: 'ui',
+    correlationId,
+  });
   return { expense: updated };
 }
 
@@ -557,6 +578,18 @@ export async function createReceivableAccount(
       balanceMinor: 0,
     })
     .returning();
+
+  await db.insert(auditEvents).values({
+    tenantId: context.tenantId,
+    actorUserId: context.userId,
+    actorUid: context.uid,
+    action: 'accounts.credit_account_created',
+    entityType: 'credit_account',
+    entityId: created.id,
+    inputSource: 'ui',
+    correlationId,
+    metadataJson: { accountName: created.accountName, creditLimitMinor },
+  });
 
   return { account: created };
 }
@@ -660,6 +693,18 @@ export async function recordReceivableEntry(
       })
       .returning();
 
+    await tx.insert(auditEvents).values({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: `accounts.credit_${input.entryType}`,
+      entityType: 'credit_account',
+      entityId: acc.id,
+      inputSource: 'ui',
+      correlationId,
+      metadataJson: { amountMinor, nextBalance },
+    });
+
     return { account: updatedAcc, entry };
   });
 }
@@ -711,21 +756,71 @@ export async function recordSupplierPayment(
     return { payment };
   }
 
-  const [created] = await db
-    .insert(supplierPayments)
-    .values({
-      tenantId: context.tenantId,
-      branchId: context.branchId,
-      supplierId: input.supplierId,
-      supplierInvoiceId: input.supplierInvoiceId ?? null,
-      amountMinor,
-      method: input.method,
-      referenceNo: input.referenceNo,
-      paidDate,
-      notes: input.notes,
-      recordedByUserId: context.userId,
-    })
-    .returning();
+  return db.transaction(async (tx) => {
+    const [sup] = await tx
+      .select({ id: suppliers.id })
+      .from(suppliers)
+      .where(and(eq(suppliers.id, input.supplierId), eq(suppliers.tenantId, context.tenantId)))
+      .limit(1);
+    if (!sup) throw new NotFoundError('Supplier not found');
 
-  return { payment: created };
+    const [created] = await tx
+      .insert(supplierPayments)
+      .values({
+        tenantId: context.tenantId,
+        branchId: context.branchId,
+        supplierId: sup.id,
+        supplierInvoiceId: input.supplierInvoiceId ?? null,
+        amountMinor,
+        method: input.method,
+        referenceNo: input.referenceNo,
+        paidDate,
+        notes: input.notes,
+        recordedByUserId: context.userId,
+      })
+      .returning();
+
+    await tx.insert(auditEvents).values({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'accounts.supplier_payment_recorded',
+      entityType: 'supplier_payment',
+      entityId: created.id,
+      inputSource: 'ui',
+      correlationId,
+      metadataJson: { supplierId: sup.id, amountMinor, method: input.method },
+    });
+
+    return { payment: created };
+  });
+}
+
+export function formatAccountsTaxSummaryCsv(
+  workspaceName: string,
+  overview: AccountsOverviewResponse
+): string {
+  const fmt = (minor: number) => (minor / 100).toFixed(2);
+  const grossReceiptsMinor =
+    overview.dailyPnl.clinicCollectionsMinor + overview.dailyPnl.pharmacyNetSalesMinor;
+  // Sri Lanka healthcare services & pharmaceuticals are largely VAT-exempt, while SSCL (2.5%) applies above statutory thresholds.
+  const ssclEstimateMinor = Math.round(grossReceiptsMinor * 0.025);
+  const rows: string[][] = [
+    ['Section', 'Line Item (IRD / Tax Compliance)', 'Value (LKR)', 'Notes'],
+    ['Header', 'Entity / Workspace', workspaceName, `Business Date: ${overview.businessDate}`],
+    ['Income', 'Clinic Collections (OPD / Channeling)', fmt(overview.dailyPnl.clinicCollectionsMinor), 'Medical Services (VAT Exempt)'],
+    ['Income', 'Doctor Channeling Payouts (Liability)', fmt(overview.dailyPnl.doctorPayoutsMinor), 'Deductible Pass-Through Payout'],
+    ['Income', 'Clinic Net Retained', fmt(overview.dailyPnl.clinicNetAfterDoctorMinor), 'Clinic Margin'],
+    ['Income', 'Pharmacy Net Sales', fmt(overview.dailyPnl.pharmacyNetSalesMinor), 'Net of Returns & Discounts'],
+    ['COGS', 'Pharmacy FEFO Cost of Goods Sold', fmt(overview.dailyPnl.pharmacyCogsMinor), 'Verified Cost Layers'],
+    ['Profit', 'Pharmacy Gross Profit', fmt(overview.dailyPnl.pharmacyGrossProfitMinor), ''],
+    ['OpEx', 'Operating Expenses (Posted)', fmt(overview.dailyPnl.operatingExpensesMinor), `${overview.expenses.length} Voucher(s)`],
+    ['Net', 'True Daily Net Profit (Taxable Base Est.)', fmt(overview.dailyPnl.trueNetProfitMinor), 'Before Income Tax'],
+    ['Compliance', 'Estimated SSCL Reference (2.5% Gross)', fmt(ssclEstimateMinor), 'Verify statutory turnover threshold with Tax Advisor'],
+    ['Working Capital', 'Total Outstanding Receivables (AR)', fmt(overview.receivables.totalOutstandingMinor), `60d+ Overdue: ${fmt(overview.receivables.aging.days60PlusMinor)}`],
+    ['Working Capital', 'Total Supplier Payables (AP)', fmt(overview.payables.totalPayableMinor), `60d+ Overdue: ${fmt(overview.payables.aging.days60PlusMinor)}`],
+  ];
+  return rows
+    .map((row) => row.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(','))
+    .join('\n');
 }

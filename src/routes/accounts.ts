@@ -7,6 +7,7 @@ import {
 } from '../contracts/departments.ts';
 import {
   createReceivableAccount,
+  formatAccountsTaxSummaryCsv,
   getAccountsOverview,
   recordOperatingExpense,
   recordReceivableEntry,
@@ -28,6 +29,25 @@ accountsRouter.get('/overview', requireAuth, async (req: AuthRequest, res) => {
     const date = typeof req.query.date === 'string' ? req.query.date : undefined;
     const overview = await getAccountsOverview(context, date);
     return res.json({ overview, correlationId });
+  } catch (err) {
+    return sendApiError(res, err, correlationId);
+  }
+});
+
+accountsRouter.get('/tax-summary.csv', requireAuth, async (req: AuthRequest, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  const correlationId = req.correlationId!;
+  try {
+    const context = await requireActiveWorkspace(req.authUser!, req.header('x-tenant-id') || undefined);
+    const date = typeof req.query.date === 'string' ? req.query.date : undefined;
+    const overview = await getAccountsOverview(context, date);
+    const csv = formatAccountsTaxSummaryCsv(context.tenantName, overview);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="suwaseva-ird-tax-summary-${overview.businessDate}.csv"`
+    );
+    return res.send(csv);
   } catch (err) {
     return sendApiError(res, err, correlationId);
   }

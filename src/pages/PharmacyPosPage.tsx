@@ -43,6 +43,8 @@ export function PharmacyPosPage() {
   const [search, setSearch] = useState('');
   const [cart, setCart] = useState<CartLine[]>([]);
   const [discountLkr, setDiscountLkr] = useState(0);
+  const [managerOverridePin, setManagerOverridePin] = useState('');
+  const [showManagerPin, setShowManagerPin] = useState(false);
   const [cashTenderLkr, setCashTenderLkr] = useState(0);
   const [cardTenderLkr, setCardTenderLkr] = useState(0);
   const [prescriptionRef, setPrescriptionRef] = useState('');
@@ -84,13 +86,20 @@ export function PharmacyPosPage() {
   useEffect(() => {
     const onOnline = () => setIsOnline(true);
     const onOffline = () => setIsOnline(false);
+    const onPosSynced = () => {
+      queryClient.invalidateQueries({ queryKey: ['pharmacy-stock', activeTenantId] });
+      queryClient.invalidateQueries({ queryKey: ['pharmacy-shifts', activeTenantId] });
+      queryClient.invalidateQueries({ queryKey: ['pharmacy-pos-sales', activeTenantId] });
+    };
     window.addEventListener('online', onOnline);
     window.addEventListener('offline', onOffline);
+    window.addEventListener('suwaseva:pos-synced', onPosSynced);
     return () => {
       window.removeEventListener('online', onOnline);
       window.removeEventListener('offline', onOffline);
+      window.removeEventListener('suwaseva:pos-synced', onPosSynced);
     };
-  }, []);
+  }, [activeTenantId, queryClient]);
 
   const hasPharmacistGrant =
     session?.workspace?.professionalGrants.some((g) => g.grantType === 'pharmacist' && g.active) ??
@@ -172,7 +181,10 @@ export function PharmacyPosPage() {
   }, [stockQuery.data]);
 
   const subtotalMinor = cart.reduce((acc, l) => acc + l.unitSalePriceMinor * l.qtyPacks, 0);
-  const discountMinor = Math.round(Number(discountLkr) * 100);
+  const discountMinor = Math.min(
+    subtotalMinor,
+    Math.max(0, Math.round((Number(discountLkr) || 0) * 100))
+  );
   const totalMinor = Math.max(0, subtotalMinor - discountMinor);
   const requiresGate = cart.some((c) => c.requiresPharmacistRelease);
 
@@ -267,8 +279,8 @@ export function PharmacyPosPage() {
   const checkoutMutation = useMutation({
     mutationFn: () => {
       const payments: Array<{ method: 'cash' | 'card' | 'bank'; amountMinor: number }> = [];
-      const cashMin = Math.round(Number(cashTenderLkr) * 100);
-      const cardMin = Math.round(Number(cardTenderLkr) * 100);
+      const cashMin = Math.max(0, Math.round((Number(cashTenderLkr) || 0) * 100));
+      const cardMin = Math.max(0, Math.round((Number(cardTenderLkr) || 0) * 100));
       if (cashMin > 0) payments.push({ method: 'cash', amountMinor: cashMin });
       if (cardMin > 0) payments.push({ method: 'card', amountMinor: cardMin });
       if (payments.length === 0 && totalMinor >= 0) {
@@ -285,6 +297,7 @@ export function PharmacyPosPage() {
         })),
         discountMinor,
         approvalId: approvalStillMatches ? approvalInfo!.id : null,
+        managerOverridePin: managerOverridePin.trim() || undefined,
         payments,
       });
     },
@@ -310,6 +323,8 @@ export function PharmacyPosPage() {
       setActiveDispenseOrderId(null);
       setPrescriptionRef('');
       setDiscountLkr(0);
+      setManagerOverridePin('');
+      setShowManagerPin(false);
       setCashTenderLkr(0);
       setCardTenderLkr(0);
       queryClient.invalidateQueries({ queryKey: ['pharmacy-stock', activeTenantId] });
@@ -318,6 +333,9 @@ export function PharmacyPosPage() {
       barcodeInputRef.current?.focus();
     },
     onError: (err) => {
+      if (err instanceof ApiClientError && err.envelope.code === 'GOVERNANCE_PIN_REQUIRED') {
+        setShowManagerPin(true);
+      }
       setErrorMsg(err instanceof ApiClientError ? err.envelope.message : 'POS checkout failed.');
     },
   });
@@ -435,15 +453,15 @@ export function PharmacyPosPage() {
     setApprovalInfo(null);
     setErrorMsg(null);
     setSuccessMsg(
-      `Loaded Rx ${order.orderNumber} for ${order.personName} (${order.prescriberName}) into POS cart.`
+      `Loaded Rx ${order.orderNumber} for ${order.patientName} (${order.prescriberName}) into POS cart.`
     );
   };
 
   const handleQueueOfflineSale = () => {
     if (!activeTenantId || !openShift || cart.length === 0) return;
     const payments: Array<{ method: 'cash' | 'card' | 'bank'; amountMinor: number }> = [];
-    const cashMin = Math.round(Number(cashTenderLkr) * 100);
-    const cardMin = Math.round(Number(cardTenderLkr) * 100);
+    const cashMin = Math.max(0, Math.round((Number(cashTenderLkr) || 0) * 100));
+    const cardMin = Math.max(0, Math.round((Number(cardTenderLkr) || 0) * 100));
     if (cashMin > 0) payments.push({ method: 'cash', amountMinor: cashMin });
     if (cardMin > 0) payments.push({ method: 'card', amountMinor: cardMin });
     if (payments.length === 0) {
@@ -626,7 +644,7 @@ export function PharmacyPosPage() {
               >
                 <div className="space-y-0.5 text-xs">
                   <div className="font-semibold text-white font-mono-tabular">
-                    {order.orderNumber} · {order.personName}
+                    {order.orderNumber} · {order.patientName}
                   </div>
                   <div className="text-slate-300">
                     {order.prescriberName} ·{' '}
@@ -831,7 +849,7 @@ export function PharmacyPosPage() {
                     type="number"
                     min={0}
                     value={discountLkr}
-                    onChange={(e) => setDiscountLkr(Number(e.target.value))}
+                    onChange={(e) => setDiscountLkr(Math.max(0, Number(e.target.value) || 0))}
                     className="w-28 min-h-[34px] px-2 neon-input rounded font-mono-tabular text-right"
                   />
                 </div>
@@ -846,7 +864,7 @@ export function PharmacyPosPage() {
                       type="number"
                       min={0}
                       value={cashTenderLkr}
-                      onChange={(e) => setCashTenderLkr(Number(e.target.value))}
+                      onChange={(e) => setCashTenderLkr(Math.max(0, Number(e.target.value) || 0))}
                       className="w-full min-h-[36px] px-2 neon-input rounded font-mono-tabular"
                     />
                   </label>
@@ -856,11 +874,30 @@ export function PharmacyPosPage() {
                       type="number"
                       min={0}
                       value={cardTenderLkr}
-                      onChange={(e) => setCardTenderLkr(Number(e.target.value))}
+                      onChange={(e) => setCardTenderLkr(Math.max(0, Number(e.target.value) || 0))}
                       className="w-full min-h-[36px] px-2 neon-input rounded font-mono-tabular"
                     />
                   </label>
                 </div>
+
+                {(discountMinor > 0 || showManagerPin) && (
+                  <label className="block space-y-1 pt-1">
+                    <span className="text-amber-300 font-medium">
+                      Owner / Manager Override PIN (Required above discount limit)
+                    </span>
+                    <input
+                      type="password"
+                      inputMode="numeric"
+                      maxLength={6}
+                      value={managerOverridePin}
+                      onChange={(e) =>
+                        setManagerOverridePin(e.target.value.replace(/\D/g, '').slice(0, 6))
+                      }
+                      placeholder="4–6 digit Shift PIN"
+                      className="w-full min-h-[36px] px-2.5 neon-input rounded font-mono-tabular"
+                    />
+                  </label>
+                )}
               </div>
 
               <div className="space-y-2">
@@ -918,7 +955,7 @@ export function PharmacyPosPage() {
 
       {/* 80mm Thermal ESC/POS Print Receipt Root */}
       {lastReceipt && (
-        <div className="thermal-80mm-only thermal-80mm-root hidden">
+        <div className="thermal-80mm-only thermal-80mm-root">
           <div style={{ textAlign: 'center', borderBottom: '1px dashed #000', paddingBottom: '4px', marginBottom: '4px' }}>
             <div style={{ fontWeight: 700, fontSize: '12px' }}>
               {session?.workspace?.tenantName ?? 'SuwaSeva Pharmacy'}

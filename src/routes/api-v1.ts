@@ -41,6 +41,8 @@ import { billingRouter } from './billing.ts';
 import { accountsRouter } from './accounts.ts';
 import { purchasingRouter } from './purchasing.ts';
 import { hrAdminRouter } from './hr-admin.ts';
+import { autopilotRouter } from './autopilot.ts';
+import { publicRouter } from './public.ts';
 
 export const apiV1Router = express.Router();
 
@@ -335,3 +337,5 @@ apiV1Router.use('/pharmacy', pharmacyRouter);
 apiV1Router.use('/accounts', accountsRouter);
 apiV1Router.use('/purchasing', purchasingRouter);
 apiV1Router.use('/hr-admin', hrAdminRouter);
+apiV1Router.use('/autopilot', autopilotRouter);
+apiV1Router.use('/public', publicRouter);

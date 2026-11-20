@@ -1,4 +1,4 @@
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
+import { BrowserRouter, Navigate, Route, Routes, useParams } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import './locales/i18n.ts';
 import { AuthProvider, useAuth } from './context/AuthContext.tsx';
@@ -19,6 +19,8 @@ import { CombinedReportsPage } from './pages/CombinedReportsPage.tsx';
 import { AccountsPage } from './pages/AccountsPage.tsx';
 import { PurchasingPage } from './pages/PurchasingPage.tsx';
 import { HrAdminPage } from './pages/HrAdminPage.tsx';
+import { AutopilotCockpitPage } from './pages/AutopilotCockpitPage.tsx';
+import { SelfCheckInKioskPage } from './pages/SelfCheckInKioskPage.tsx';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -88,6 +90,7 @@ function AuthenticatedRoutes() {
           <AppShell>
             <Routes>
               <Route path="/" element={<HomeAssistantPage />} />
+              <Route path="/autopilot" element={<AutopilotCockpitPage />} />
               <Route path="/today" element={<TodayBoardPage />} />
               <Route path="/pharmacy/pos" element={<PharmacyPosPage />} />
               <Route path="/pharmacy/catalogue" element={<PharmacyCataloguePage />} />
@@ -110,14 +113,27 @@ function AuthenticatedRoutes() {
   );
 }
 
+function KioskRouteWrapper() {
+  const { tenantSlug } = useParams<{ tenantSlug: string }>();
+  return <SelfCheckInKioskPage tenantSlug={tenantSlug ?? ''} />;
+}
+
 export default function App() {
   return (
     <QueryClientProvider client={queryClient}>
-      <AuthProvider>
-        <BrowserRouter>
-          <AuthenticatedRoutes />
-        </BrowserRouter>
-      </AuthProvider>
+      <BrowserRouter>
+        <Routes>
+          <Route path="/kiosk/:tenantSlug" element={<KioskRouteWrapper />} />
+          <Route
+            path="*"
+            element={
+              <AuthProvider>
+                <AuthenticatedRoutes />
+              </AuthProvider>
+            }
+          />
+        </Routes>
+      </BrowserRouter>
     </QueryClientProvider>
   );
 }

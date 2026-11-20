@@ -138,7 +138,32 @@ export async function getPharmacyAlertsDashboard(
 
   expiringLots.sort((a, b) => (a.daysUntilExpiry ?? 999) - (b.daysUntilExpiry ?? 999));
 
-  const REORDER_THRESHOLD = 50;
+  const productParMap = new Map<string, { reorder: number; targetPar: number }>();
+  if (!isDatabaseConfigured) {
+    for (const p of getMemoryStore().products.filter((x) => x.tenantId === context.tenantId)) {
+      productParMap.set(p.id, {
+        reorder: p.reorderPointBase ?? 50,
+        targetPar: p.targetParBase ?? 200,
+      });
+    }
+  } else {
+    const pRows = await db
+      .select({
+        id: products.id,
+        reorderPointBase: products.reorderPointBase,
+        targetParBase: products.targetParBase,
+      })
+      .from(products)
+      .where(eq(products.tenantId, context.tenantId));
+    for (const p of pRows) {
+      productParMap.set(p.id, {
+        reorder: p.reorderPointBase ?? 50,
+        targetPar: p.targetParBase ?? 200,
+      });
+    }
+  }
+
+  const DEFAULT_REORDER_THRESHOLD = 50;
   const lowStockSkus: StockAlertsDashboardResponse['lowStockSkus'] = [];
   const deadStockSkus: StockAlertsDashboardResponse['deadStockSkus'] = [];
 
@@ -152,16 +177,19 @@ export async function getPharmacyAlertsDashboard(
   }
 
   for (const sku of skuTotalMap.values()) {
-    if (sku.sellableOnHand < REORDER_THRESHOLD) {
+    const par = productParMap.get(sku.productId);
+    const threshold = par?.reorder ?? DEFAULT_REORDER_THRESHOLD;
+    const targetPar = par?.targetPar ?? Math.max(threshold * 2, 100);
+    if (sku.sellableOnHand < threshold) {
       lowStockSkus.push({
         productId: sku.productId,
         skuCode: sku.skuCode,
         productName: sku.productName,
         manufacturer: sku.manufacturer,
         sellableOnHand: sku.sellableOnHand,
-        reorderThreshold: REORDER_THRESHOLD,
+        reorderThreshold: threshold,
         baseUnit: sku.baseUnit,
-        suggestedOrderQty: Math.max(REORDER_THRESHOLD * 2 - sku.sellableOnHand, 50),
+        suggestedOrderQty: Math.max(targetPar - sku.sellableOnHand, 50),
       });
     }
 
@@ -1552,12 +1580,34 @@ export async function getCombinedZReport(
         }
       }
 
-      for (const pay of store.posPayments) {
-        if (pay.tenantId === context.tenantId && daySaleIds.has(pay.saleId)) {
-          if (pay.method === 'cash') cashMinor += pay.amountMinor;
-          else if (pay.method === 'card') cardMinor += pay.amountMinor;
-          else bankMinor += pay.amountMinor;
+      const dayPays = store.posPayments.filter(
+        (pay) => pay.tenantId === context.tenantId && daySaleIds.has(pay.saleId)
+      );
+      for (const s of daySales) {
+        const salePays = dayPays.filter((p) => p.saleId === s.id);
+        let saleCash = 0;
+        let saleCard = 0;
+        let saleBank = 0;
+        for (const p of salePays) {
+          if (p.method === 'cash') saleCash += p.amountMinor;
+          else if (p.method === 'card') saleCard += p.amountMinor;
+          else saleBank += p.amountMinor;
         }
+        let changeLeft = Math.max(0, s.changeMinor);
+        const cashChange = Math.min(saleCash, changeLeft);
+        saleCash -= cashChange;
+        changeLeft -= cashChange;
+        if (changeLeft > 0) {
+          const cardChange = Math.min(saleCard, changeLeft);
+          saleCard -= cardChange;
+          changeLeft -= cardChange;
+        }
+        if (changeLeft > 0) {
+          saleBank = Math.max(0, saleBank - changeLeft);
+        }
+        cashMinor += saleCash;
+        cardMinor += saleCard;
+        bankMinor += saleBank;
       }
 
       for (const ret of store.posReturns) {
@@ -1568,8 +1618,14 @@ export async function getCombinedZReport(
           ret.returnedAt < dayEnd
         ) {
           returnsMinor += ret.refundAmountMinor;
+          if (ret.refundMethod === 'cash') cashMinor -= ret.refundAmountMinor;
+          else if (ret.refundMethod === 'card') cardMinor -= ret.refundAmountMinor;
+          else bankMinor -= ret.refundAmountMinor;
         }
       }
+      cashMinor = Math.max(0, cashMinor);
+      cardMinor = Math.max(0, cardMinor);
+      bankMinor = Math.max(0, bankMinor);
       netSalesMinor = Math.max(0, netSalesMinor - returnsMinor);
 
       for (const inv of store.supplierInvoices) {
@@ -1653,12 +1709,32 @@ export async function getCombinedZReport(
         .select()
         .from(posPayments)
         .where(eq(posPayments.tenantId, context.tenantId));
-      for (const p of pays) {
-        if (daySaleIds.has(p.saleId)) {
-          if (p.method === 'cash') cashMinor += p.amountMinor;
-          else if (p.method === 'card') cardMinor += p.amountMinor;
-          else bankMinor += p.amountMinor;
+      const dayPays = pays.filter((p) => daySaleIds.has(p.saleId));
+      for (const s of daySales) {
+        const salePays = dayPays.filter((p) => p.saleId === s.id);
+        let saleCash = 0;
+        let saleCard = 0;
+        let saleBank = 0;
+        for (const p of salePays) {
+          if (p.method === 'cash') saleCash += p.amountMinor;
+          else if (p.method === 'card') saleCard += p.amountMinor;
+          else saleBank += p.amountMinor;
         }
+        let changeLeft = Math.max(0, s.changeMinor);
+        const cashChange = Math.min(saleCash, changeLeft);
+        saleCash -= cashChange;
+        changeLeft -= cashChange;
+        if (changeLeft > 0) {
+          const cardChange = Math.min(saleCard, changeLeft);
+          saleCard -= cardChange;
+          changeLeft -= cardChange;
+        }
+        if (changeLeft > 0) {
+          saleBank = Math.max(0, saleBank - changeLeft);
+        }
+        cashMinor += saleCash;
+        cardMinor += saleCard;
+        bankMinor += saleBank;
       }
 
       const rets = await db
@@ -1666,8 +1742,16 @@ export async function getCombinedZReport(
         .from(posReturns)
         .where(and(eq(posReturns.tenantId, context.tenantId), eq(posReturns.branchId, context.branchId)));
       for (const r of rets) {
-        if (r.returnedAt >= dayStart && r.returnedAt < dayEnd) returnsMinor += r.refundAmountMinor;
+        if (r.returnedAt >= dayStart && r.returnedAt < dayEnd) {
+          returnsMinor += r.refundAmountMinor;
+          if (r.refundMethod === 'cash') cashMinor -= r.refundAmountMinor;
+          else if (r.refundMethod === 'card') cardMinor -= r.refundAmountMinor;
+          else bankMinor -= r.refundAmountMinor;
+        }
       }
+      cashMinor = Math.max(0, cashMinor);
+      cardMinor = Math.max(0, cardMinor);
+      bankMinor = Math.max(0, bankMinor);
       netSalesMinor = Math.max(0, netSalesMinor - returnsMinor);
 
       const supInvs = await db

@@ -1,6 +1,10 @@
 import { useEffect, useState } from 'react';
 import { CloudOff, RefreshCw } from 'lucide-react';
-import { getOfflinePosQueue, syncQueuedPosSales } from '../lib/offline-pos.ts';
+import {
+  getOfflinePosQueue,
+  hydrateOfflineStoreFromIdb,
+  syncQueuedPosSales,
+} from '../lib/offline-pos.ts';
 import { useAuth } from '../context/AuthContext.tsx';
 
 export function OfflineIndicator() {
@@ -10,6 +14,7 @@ export function OfflineIndicator() {
   );
   const [queuedCount, setQueuedCount] = useState(0);
   const [syncing, setSyncing] = useState(false);
+  const [syncFailureMsg, setSyncFailureMsg] = useState<string | null>(null);
 
   useEffect(() => {
     const refreshCount = () => {
@@ -17,13 +22,25 @@ export function OfflineIndicator() {
         setQueuedCount(getOfflinePosQueue(activeTenantId).length);
       }
     };
-    refreshCount();
+    if (activeTenantId) {
+      void hydrateOfflineStoreFromIdb(activeTenantId).then(refreshCount);
+    } else {
+      refreshCount();
+    }
 
     const handleOnline = async () => {
       setIsOnline(true);
       if (activeTenantId && getOfflinePosQueue(activeTenantId).length > 0) {
         setSyncing(true);
-        await syncQueuedPosSales(activeTenantId).finally(() => setSyncing(false));
+        const res = await syncQueuedPosSales(activeTenantId).finally(() => setSyncing(false));
+        if (res.synced > 0) {
+          window.dispatchEvent(new CustomEvent('suwaseva:pos-synced'));
+        }
+        setSyncFailureMsg(
+          res.failed > 0
+            ? `${res.failed} offline checkout(s) need manual review or re-sync.`
+            : null
+        );
         refreshCount();
       }
     };
@@ -42,13 +59,21 @@ export function OfflineIndicator() {
     };
   }, [activeTenantId]);
 
-  if (isOnline && queuedCount === 0) return null;
+  if (isOnline && queuedCount === 0 && !syncFailureMsg) return null;
 
   const handleManualSync = async () => {
     if (!activeTenantId || !isOnline) return;
     setSyncing(true);
     try {
-      await syncQueuedPosSales(activeTenantId);
+      const res = await syncQueuedPosSales(activeTenantId);
+      if (res.synced > 0) {
+        window.dispatchEvent(new CustomEvent('suwaseva:pos-synced'));
+      }
+      setSyncFailureMsg(
+        res.failed > 0
+          ? `${res.failed} offline checkout(s) failed to sync (check shift or stock).`
+          : null
+      );
       setQueuedCount(getOfflinePosQueue(activeTenantId).length);
     } finally {
       setSyncing(false);
@@ -63,7 +88,7 @@ export function OfflineIndicator() {
           <span>
             {!isOnline
               ? 'Offline Mode — POS continues using cached catalogue and queues checkouts locally.'
-              : `${queuedCount} offline POS checkout(s) pending server sync.`}
+              : syncFailureMsg ?? `${queuedCount} offline POS checkout(s) pending server sync.`}
           </span>
         </div>
         {isOnline && queuedCount > 0 && (

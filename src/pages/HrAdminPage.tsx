@@ -274,47 +274,28 @@ export function HrAdminPage() {
 
   const overview = hrQuery.data?.overview;
 
-  const downloadPayrollBankCsv = () => {
+  const downloadPayrollBankCsv = async () => {
     const latestRun = overview?.payrollRuns[0];
-    if (!latestRun) return;
-    const rows = [
-      [
-        'Payroll Month',
-        'Staff Name',
-        'Designation',
-        'Basic (LKR)',
-        'Allowances (LKR)',
-        'Commission (LKR)',
-        'EPF Employee 8%',
-        'EPF Employer 12%',
-        'ETF Employer 3%',
-        'Net Pay (LKR)',
-      ].join(','),
-      ...latestRun.slips.map((s) =>
-        [
-          latestRun.payrollMonth,
-          `"${s.staffName}"`,
-          `"${s.designation}"`,
-          (s.basicMinor / 100).toFixed(2),
-          (s.allowancesMinor / 100).toFixed(2),
-          (s.commissionMinor / 100).toFixed(2),
-          (s.epfEmployee8Minor / 100).toFixed(2),
-          (s.epfEmployer12Minor / 100).toFixed(2),
-          (s.etfEmployer3Minor / 100).toFixed(2),
-          (s.netPayMinor / 100).toFixed(2),
-        ].join(',')
-      ),
-    ].join('\n');
-
-    const blob = new Blob([rows], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `suwaseva-payroll-${latestRun.payrollMonth}.csv`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    if (!latestRun || !activeTenantId) return;
+    try {
+      const csv = await apiClient.fetchSlipsBankPayrollCsv(
+        activeTenantId,
+        latestRun.payrollMonth
+      );
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `suwaseva-slips-payroll-${latestRun.payrollMonth}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setErrorMsg(
+        err instanceof Error ? err.message : 'Unable to download SLIPS Bank Payroll CSV.'
+      );
+    }
   };
 
   return (

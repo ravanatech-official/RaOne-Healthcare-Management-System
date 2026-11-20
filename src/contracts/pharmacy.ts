@@ -81,6 +81,8 @@ export const CreateProductSchema = z.object({
   storageCondition: StorageConditionSchema.default('ambient'),
   baseUnit: BaseUnitSchema,
   minShelfLifeDays: z.number().int().min(0).max(1825).default(30),
+  reorderPointBase: z.number().int().min(0).max(100000).optional(),
+  targetParBase: z.number().int().min(1).max(500000).optional(),
   initialPack: z
     .object({
       variantName: z.string().trim().min(2).max(100),
@@ -221,6 +223,7 @@ export const CheckoutPosSaleSchema = z.object({
   items: z.array(PosCartItemInputSchema).min(1).max(50),
   discountMinor: z.number().int().min(0).max(100000000).default(0),
   approvalId: z.string().uuid().optional().nullable(),
+  managerOverridePin: z.string().trim().regex(/^\d{4,6}$/).optional(),
   payments: z.array(PosPaymentSplitSchema).min(1).max(5),
 });
 export type CheckoutPosSaleInput = z.infer<typeof CheckoutPosSaleSchema>;

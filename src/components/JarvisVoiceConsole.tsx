@@ -204,7 +204,7 @@ export function JarvisVoiceConsole() {
           text: speechText.slice(0, 550),
           locale,
         });
-        if (tts.mode === 'gemini_audio' && tts.audioBase64) {
+        if (tts.mode === 'audio_wav' && tts.audioBase64) {
           const audio = new Audio(`data:${tts.mimeType || 'audio/wav'};base64,${tts.audioBase64}`);
           audioRef.current = audio;
           audio.onended = () => {

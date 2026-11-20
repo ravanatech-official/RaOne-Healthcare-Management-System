@@ -11,6 +11,7 @@ import {
   History,
   MonitorPlay,
   Pill,
+  QrCode,
   RefreshCw,
   Repeat,
   Trash2,
@@ -19,7 +20,14 @@ import {
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../context/AuthContext.tsx';
-import { apiClient, ApiClientError, formatLkrMinor, formatTimeColombo } from '../lib/api-client.ts';
+import {
+  apiClient,
+  ApiClientError,
+  formatLkrMinor,
+  formatTimeColombo,
+  toColomboDatetimeLocal,
+  todayColomboDate,
+} from '../lib/api-client.ts';
 
 type StatusFilter = 'all' | 'scheduled' | 'arrived' | 'completed' | 'cancelled';
 type BoardTab = 'today' | 'schedules' | 'payouts';
@@ -51,10 +59,9 @@ export function TodayBoardPage() {
   const [bookPersonId, setBookPersonId] = useState('');
   const [bookServiceId, setBookServiceId] = useState('');
   const [bookResourceId, setBookResourceId] = useState('');
-  const [bookStartsAtLocal, setBookStartsAtLocal] = useState(() => {
-    const d = new Date(Date.now() + 3600_000);
-    return new Date(d.getTime() - d.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
-  });
+  const [bookStartsAtLocal, setBookStartsAtLocal] = useState(() =>
+    toColomboDatetimeLocal(new Date(Date.now() + 3600_000))
+  );
 
   // Reschedule inline target
   const [rescheduleTarget, setRescheduleTarget] = useState<{
@@ -99,7 +106,7 @@ export function TodayBoardPage() {
   const [schedEndTime, setSchedEndTime] = useState('19:00');
   const [schedSlotMin, setSchedSlotMin] = useState(20);
   const [holidayResourceId, setHolidayResourceId] = useState('');
-  const [holidayDate, setHolidayDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [holidayDate, setHolidayDate] = useState(() => todayColomboDate());
   const [holidayReason, setHolidayReason] = useState('Poya Day / Doctor Leave');
 
   // Commission split editor
@@ -127,7 +134,7 @@ export function TodayBoardPage() {
     enabled: Boolean(activeTenantId),
   });
 
-  const effectiveDate = selectedDate || data?.businessDate || new Date().toISOString().slice(0, 10);
+  const effectiveDate = selectedDate || data?.businessDate || todayColomboDate();
   const effectiveBookResourceId = bookResourceId || data?.resources[0]?.id || '';
   const slotQueryDate = bookStartsAtLocal.slice(0, 10) || effectiveDate;
 
@@ -292,7 +299,7 @@ export function TodayBoardPage() {
     onSuccess: (res) => {
       setFeedback({
         type: 'ok',
-        text: `Doctor delay (+${res.delayMinutes}m) broadcasted to ${res.updatedCount} active queue token(s).`,
+        text: `Doctor delay (+${res.delayMinutes}m) broadcasted to ${res.affectedTokens} active queue token(s).`,
       });
       queryClient.invalidateQueries({ queryKey: ['today', activeTenantId] });
     },
@@ -532,6 +539,13 @@ export function TodayBoardPage() {
           >
             <MonitorPlay className="w-4 h-4 neon-text-cyan" aria-hidden="true" />
             <span>Waiting Room TV</span>
+          </Link>
+          <Link
+            to="/autopilot"
+            className="min-h-[40px] px-3.5 neon-btn-secondary text-xs font-medium rounded-lg inline-flex items-center gap-1.5 whitespace-nowrap"
+          >
+            <QrCode className="w-4 h-4 neon-text-cyan" aria-hidden="true" />
+            <span>QR Kiosk &amp; Shift SOP</span>
           </Link>
           <button
             type="button"
@@ -1244,7 +1258,7 @@ export function TodayBoardPage() {
                                     setRescheduleTarget({
                                       id: apt.id,
                                       version: apt.version,
-                                      startsAtLocal: bookStartsAtLocal,
+                                      startsAtLocal: toColomboDatetimeLocal(new Date(apt.startsAt)),
                                     })
                                   }
                                   className="px-2 py-1 text-xs font-medium neon-btn-secondary rounded inline-flex items-center gap-1"

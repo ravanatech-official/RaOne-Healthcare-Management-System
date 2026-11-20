@@ -21,6 +21,7 @@ const resources = {
         reports: 'Z-වාර්තා',
         team: 'කණ්ඩායම',
         audit: 'පිරික්සුම්',
+        autopilot: 'ස්වයංක්‍රීය පාලනය (SOP)',
         help: 'උදව්',
       },
       auth: {
@@ -29,7 +30,6 @@ const resources = {
         signInSubtitle: 'ඔබේ සායන හෝ ඖෂධහල් ගිණුමට ආරක්ෂිතව පිවිසෙන්න.',
         signInButton: 'ඇතුළු වන්න',
         signUpButton: 'ගිණුම සාදන්න',
-        lampHint: 'ලාම්පුවේ ලණුව අදින්න — ආලෝකය On / Off කරන්න',
         signingIn: 'ඇතුළු වෙමින්...',
         signOut: 'පිටවන්න',
         lockDevice: 'තිරය අගුළු දමන්න',
@@ -241,6 +241,7 @@ const resources = {
         reports: 'Z-Reports',
         team: 'Team',
         audit: 'Audit',
+        autopilot: 'Autopilot & SOP',
         help: 'Help',
       },
       auth: {
@@ -249,7 +250,6 @@ const resources = {
         signInSubtitle: 'Sign in to continue to your SuwaSeva workspace',
         signInButton: 'Sign In',
         signUpButton: 'Create Account',
-        lampHint: 'Pull the cord to toggle the desk lamp glow',
         signingIn: 'Signing in...',
         signOut: 'Sign out',
         lockDevice: 'Lock screen',

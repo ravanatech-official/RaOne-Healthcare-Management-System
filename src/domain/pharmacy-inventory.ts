@@ -451,7 +451,11 @@ export async function postGoodsReceipt(
       const manufacturer = line.manufacturer?.trim() || product.manufacturer;
       const batchNumber = line.batchNumber.trim();
       const activeRecall = store.recalls.find(
-        (r) => r.tenantId === context.tenantId && r.status === 'active' && (r.productId === product.id || r.manufacturer === manufacturer)
+        (r) =>
+          r.tenantId === context.tenantId &&
+          r.status === 'active' &&
+          (r.productId === product.id ||
+            Boolean(r.manufacturer && r.manufacturer.toLowerCase() === manufacturer.toLowerCase()))
       );
       if (activeRecall) {
         throw new ConflictError(`Active recall ${activeRecall.referenceCode} blocks receiving ${product.displayName}`, 'ACTIVE_RECALL_BLOCK');
@@ -773,7 +777,7 @@ export async function postGoodsReceipt(
             eq(recalls.status, 'active'),
             or(
               eq(recalls.productId, product.id),
-              eq(recalls.manufacturer, manufacturer)
+              sql`lower(coalesce(${recalls.manufacturer}, '')) = lower(${manufacturer})`
             )
           )
         )
@@ -1347,7 +1351,14 @@ export async function transitionLotQuality(
         throw new ConflictError(`Lot expired on ${lot.expiryCutoffDate} and cannot be released to sellable inventory`, 'EXPIRED_LOT_BLOCKED');
       }
       const activeRecall = store.recalls.find(
-        (r) => r.tenantId === context.tenantId && r.status === 'active' && (r.lotId === lot.id || r.productId === lot.productId || r.manufacturer === lot.manufacturer)
+        (r) =>
+          r.tenantId === context.tenantId &&
+          r.status === 'active' &&
+          (r.lotId === lot.id ||
+            r.productId === lot.productId ||
+            Boolean(
+              r.manufacturer && r.manufacturer.toLowerCase() === lot.manufacturer.toLowerCase()
+            ))
       );
       if (activeRecall) throw new ConflictError(`Active recall ${activeRecall.referenceCode} prevents release of this lot`, 'ACTIVE_RECALL_BLOCK');
 
@@ -1367,6 +1378,7 @@ export async function transitionLotQuality(
           sourceDocType: 'quality_release', sourceDocId: lot.id, commandId: null, packVariantId: null, uomConversionVersion: null, actorUserId: context.userId, occurredAt: now, createdAt: now,
         });
         totalReleased += moveQty;
+        if (input.qtyBase && totalReleased >= input.qtyBase) break;
       }
       if (totalReleased <= 0) throw new ValidationError('No quarantined balance available on this lot to release');
       lot.qualityStatus = 'released'; lot.releasedByGrantId = grant.id; lot.releasedAt = now; lot.updatedAt = now;
@@ -1458,7 +1470,7 @@ export async function transitionLotQuality(
             or(
               eq(recalls.lotId, lot.id),
               eq(recalls.productId, lot.productId),
-              eq(recalls.manufacturer, lot.manufacturer)
+              sql`lower(coalesce(${recalls.manufacturer}, '')) = lower(${lot.manufacturer})`
             )
           )
         )
@@ -1481,7 +1493,8 @@ export async function transitionLotQuality(
             eq(inventoryBalances.lotId, lot.id),
             ...(input.locationId ? [eq(inventoryBalances.locationId, input.locationId)] : [])
           )
-        );
+        )
+        .for('update');
 
       let totalReleased = 0;
 
@@ -1519,6 +1532,7 @@ export async function transitionLotQuality(
         });
 
         totalReleased += moveQty;
+        if (input.qtyBase && totalReleased >= input.qtyBase) break;
       }
 
       if (totalReleased <= 0) {

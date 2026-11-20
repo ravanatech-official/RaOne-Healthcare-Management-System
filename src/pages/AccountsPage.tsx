@@ -5,6 +5,7 @@ import {
   ArrowUpRight,
   Building2,
   CheckCircle2,
+  Download,
   Plus,
   Receipt,
   Trash2,
@@ -51,6 +52,8 @@ export function AccountsPage() {
   const [expAmount, setExpAmount] = useState('');
   const [expMethod, setExpMethod] = useState<'cash' | 'card' | 'bank'>('cash');
   const [expRef, setExpRef] = useState('');
+  const [expManagerPin, setExpManagerPin] = useState('');
+  const [showExpManagerPin, setShowExpManagerPin] = useState(false);
 
   // Receivable Account Form
   const [accName, setAccName] = useState('');
@@ -92,6 +95,7 @@ export function AccountsPage() {
         amountLkr: Number(expAmount),
         paymentMethod: expMethod,
         referenceNo: expRef.trim(),
+        managerOverridePin: expManagerPin.trim() || undefined,
       }),
     onSuccess: async () => {
       setErrorMsg(null);
@@ -99,10 +103,15 @@ export function AccountsPage() {
       setExpDesc('');
       setExpAmount('');
       setExpRef('');
+      setExpManagerPin('');
+      setShowExpManagerPin(false);
       await invalidateAccounts();
     },
     onError: (err) => {
       setSuccessMsg(null);
+      if (err instanceof ApiClientError && err.envelope.code === 'GOVERNANCE_PIN_REQUIRED') {
+        setShowExpManagerPin(true);
+      }
       setErrorMsg(err instanceof ApiClientError ? err.envelope.message : 'Unable to record expense.');
     },
   });
@@ -215,7 +224,36 @@ export function AccountsPage() {
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={async () => {
+              if (!activeTenantId) return;
+              try {
+                const csv = await apiClient.fetchAccountsTaxSummaryCsv(
+                  activeTenantId,
+                  date || undefined
+                );
+                const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `suwaseva-ird-tax-pnl-${date || overview?.businessDate || 'today'}.csv`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+              } catch (err) {
+                setErrorMsg(
+                  err instanceof Error ? err.message : 'Unable to download IRD Tax / P&L CSV.'
+                );
+              }
+            }}
+            className="min-h-[40px] px-3.5 rounded-lg text-xs font-medium neon-btn-secondary inline-flex items-center gap-1.5"
+          >
+            <Download className="w-4 h-4 text-cyan-300" aria-hidden="true" />
+            <span>IRD Tax / P&amp;L CSV</span>
+          </button>
           <input
             type="date"
             aria-label="Business date"
@@ -440,6 +478,25 @@ export function AccountsPage() {
                           className="w-full min-h-[42px] px-3 rounded-lg text-sm font-mono-tabular neon-input"
                         />
                       </label>
+
+                      {(showExpManagerPin || Number(expAmount || 0) > 15000) && (
+                        <label className="block space-y-1">
+                          <span className="text-xs font-medium text-amber-300">
+                            Owner / Manager Override PIN (High-Value OpEx Control)
+                          </span>
+                          <input
+                            type="password"
+                            inputMode="numeric"
+                            maxLength={6}
+                            value={expManagerPin}
+                            onChange={(e) =>
+                              setExpManagerPin(e.target.value.replace(/\D/g, '').slice(0, 6))
+                            }
+                            placeholder="4–6 digit Shift PIN"
+                            className="w-full min-h-[42px] px-3 rounded-lg text-sm font-mono-tabular neon-input"
+                          />
+                        </label>
+                      )}
 
                       <button
                         type="submit"

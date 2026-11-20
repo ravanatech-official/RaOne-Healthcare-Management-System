@@ -21,6 +21,7 @@ export const RecordOperatingExpenseSchema = z.object({
   amountLkr: z.number().positive().max(10_000_000),
   paymentMethod: z.enum(['cash', 'card', 'bank']).default('cash'),
   referenceNo: z.string().trim().max(80).optional().default(''),
+  managerOverridePin: z.string().trim().regex(/^\d{4,6}$/).optional(),
 });
 export type RecordOperatingExpenseInput = z.infer<typeof RecordOperatingExpenseSchema>;
 

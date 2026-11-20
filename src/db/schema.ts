@@ -678,6 +678,8 @@ export const products = pgTable(
     storageCondition: text('storage_condition').notNull().default('ambient'),
     baseUnit: text('base_unit').notNull(), // tablet | capsule | sealed_bottle | tube | inhaler | vial | sachet | unit
     minShelfLifeDays: integer('min_shelf_life_days').notNull().default(30),
+    reorderPointBase: integer('reorder_point_base').notNull().default(50),
+    targetParBase: integer('target_par_base').notNull().default(200),
     masterDataVersion: integer('master_data_version').notNull().default(1),
     masterDataSource: text('master_data_source').notNull().default('manual'),
     active: boolean('active').notNull().default(true),
@@ -2365,5 +2367,55 @@ export const complianceLicenses = pgTable('compliance_licenses', {
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 });
 
+// 78. Silicon Valley Autopilot: Maker-Checker Governance Rules
+export const workspaceGovernanceRules = pgTable('workspace_governance_rules', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .unique()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  maxCashierDiscountPercent: integer('max_cashier_discount_percent').notNull().default(10),
+  maxExpenseWithoutPinMinor: integer('max_expense_without_pin_minor').notNull().default(1500000), // LKR 15,000
+  maxStockWriteoffWithoutPin: integer('max_stock_writeoff_without_pin').notNull().default(25),
+  requireClosingChecklist: boolean('require_closing_checklist').notNull().default(false),
+  autoReorderEnabled: boolean('auto_reorder_enabled').notNull().default(true),
+  ownerDigestEnabled: boolean('owner_digest_enabled').notNull().default(true),
+  ownerWhatsappPhone: text('owner_whatsapp_phone').notNull().default(''),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});
 
+// 79. Silicon Valley Autopilot: Opening / Closing Digital SOP Checklists & Handover Sign-off
+export const shiftChecklistRuns = pgTable('shift_checklist_runs', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  branchId: uuid('branch_id').notNull(),
+  businessDate: text('business_date').notNull(),
+  shiftType: text('shift_type').notNull(), // opening | closing
+  status: text('status').notNull().default('in_progress'), // in_progress | completed
+  itemsJson: jsonb('items_json').notNull().default([]),
+  handoverNotes: text('handover_notes').notNull().default(''),
+  cashDrawerCountMinor: integer('cash_drawer_count_minor'),
+  completedByUserId: integer('completed_by_user_id').references(() => users.id),
+  completedByName: text('completed_by_name').notNull().default(''),
+  completedAt: timestamp('completed_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});
 
+// 80. Silicon Valley Autopilot: Daily Owner Briefings & Anomaly Digests
+export const ownerBriefings = pgTable('owner_briefings', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  branchId: uuid('branch_id').notNull(),
+  businessDate: text('business_date').notNull(),
+  summaryTextEn: text('summary_text_en').notNull(),
+  summaryTextSi: text('summary_text_si').notNull(),
+  metricsJson: jsonb('metrics_json').notNull().default({}),
+  anomaliesJson: jsonb('anomalies_json').notNull().default([]),
+  dispatchedChannel: text('dispatched_channel').notNull().default('in_app'), // in_app | whatsapp
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});

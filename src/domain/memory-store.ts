@@ -239,6 +239,8 @@ export interface MemProduct {
   storageCondition: string;
   baseUnit: string;
   minShelfLifeDays: number;
+  reorderPointBase?: number;
+  targetParBase?: number;
   active: boolean;
   createdAt: Date;
   updatedAt: Date;
@@ -1008,6 +1010,70 @@ export interface MemComplianceLicense {
   createdAt: Date;
 }
 
+export interface MemGovernanceRule {
+  id: string;
+  tenantId: string;
+  maxCashierDiscountPercent: number;
+  maxExpenseWithoutPinMinor: number;
+  maxStockWriteoffWithoutPin: number;
+  requireClosingChecklist: boolean;
+  autoReorderEnabled: boolean;
+  ownerDigestEnabled: boolean;
+  ownerWhatsappPhone: string;
+  updatedAt: Date;
+}
+
+export interface MemChecklistItemRecord {
+  key: string;
+  labelEn: string;
+  labelSi: string;
+  category: 'cash' | 'safety' | 'clinic' | 'pharmacy';
+  required: boolean;
+  completed: boolean;
+  completedByName: string;
+  completedAt: string | null;
+}
+
+export interface MemShiftChecklistRun {
+  id: string;
+  tenantId: string;
+  branchId: string;
+  businessDate: string;
+  shiftType: 'opening' | 'closing';
+  status: 'in_progress' | 'completed';
+  itemsJson: MemChecklistItemRecord[];
+  handoverNotes: string;
+  cashDrawerCountMinor: number | null;
+  completedByUserId: number | null;
+  completedByName: string;
+  completedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface MemOwnerBriefing {
+  id: string;
+  tenantId: string;
+  branchId: string;
+  businessDate: string;
+  summaryTextEn: string;
+  summaryTextSi: string;
+  metricsJson: Record<string, unknown>;
+  anomaliesJson: Array<{
+    id: string;
+    code: string;
+    severity: 'info' | 'warning' | 'critical';
+    category: string;
+    titleEn: string;
+    titleSi: string;
+    detail: string;
+    metricValue: string;
+    actionPath: string;
+  }>;
+  dispatchedChannel: 'in_app' | 'whatsapp';
+  createdAt: Date;
+}
+
 export interface MemoryStoreState {
   tenants: MemTenant[];
   legalEntities: MemLegalEntity[];
@@ -1079,6 +1145,9 @@ export interface MemoryStoreState {
   labDiagnosticOrders: MemLabDiagnosticOrder[];
   coldChainLogs: MemColdChainLog[];
   complianceLicenses: MemComplianceLicense[];
+  governanceRules: MemGovernanceRule[];
+  shiftChecklistRuns: MemShiftChecklistRun[];
+  ownerBriefings: MemOwnerBriefing[];
 }
 
 function createEmptyStore(): MemoryStoreState {
@@ -1153,6 +1222,9 @@ function createEmptyStore(): MemoryStoreState {
     labDiagnosticOrders: [],
     coldChainLogs: [],
     complianceLicenses: [],
+    governanceRules: [],
+    shiftChecklistRuns: [],
+    ownerBriefings: [],
   };
 }
 
@@ -1226,30 +1298,40 @@ export function seedStarterPharmacyAndOpsData(params: {
   const { tenantId, legalEntityId, branchId, userId, businessDate, currency } = params;
 
   if (params.hasClinic && params.resourceId) {
-    // Weekly schedules Mon-Sat 08:30 - 17:30
-    for (const day of [1, 2, 3, 4, 5, 6]) {
-      store.doctorSchedules.push({
+    const hasExistingSchedules = store.doctorSchedules.some(
+      (s) => s.tenantId === tenantId && s.resourceId === params.resourceId
+    );
+    if (!hasExistingSchedules) {
+      // Weekly schedules Mon-Sat 08:30 - 17:30
+      for (const day of [1, 2, 3, 4, 5, 6]) {
+        store.doctorSchedules.push({
+          id: crypto.randomUUID(),
+          tenantId,
+          branchId,
+          resourceId: params.resourceId,
+          dayOfWeek: day,
+          startTime: '08:30',
+          endTime: '17:30',
+          slotDurationMinutes: 20,
+          active: true,
+          createdAt: new Date(),
+        });
+      }
+    }
+    const hasExistingCommission = store.doctorCommissionRules.some(
+      (r) => r.tenantId === tenantId && r.resourceId === params.resourceId
+    );
+    if (!hasExistingCommission) {
+      store.doctorCommissionRules.push({
         id: crypto.randomUUID(),
         tenantId,
-        branchId,
         resourceId: params.resourceId,
-        dayOfWeek: day,
-        startTime: '08:30',
-        endTime: '17:30',
-        slotDurationMinutes: 20,
-        active: true,
-        createdAt: new Date(),
+        serviceId: null,
+        doctorSharePercent: 75,
+        clinicSharePercent: 25,
+        updatedAt: new Date(),
       });
     }
-    store.doctorCommissionRules.push({
-      id: crypto.randomUUID(),
-      tenantId,
-      resourceId: params.resourceId,
-      serviceId: null,
-      doctorSharePercent: 75,
-      clinicSharePercent: 25,
-      updatedAt: new Date(),
-    });
     if (params.appointmentIds) {
       params.appointmentIds.forEach((aptId, idx) => {
         store.appointmentQueueTokens.push({

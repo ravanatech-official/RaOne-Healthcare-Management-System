@@ -498,7 +498,16 @@ export async function revokeStaffInvite(
     .where(and(eq(staffInvites.id, inviteId), eq(staffInvites.tenantId, context.tenantId)))
     .returning();
   if (!updated) throw new NotFoundError('Invite not found');
-  void correlationId;
+  await db.insert(auditEvents).values({
+    tenantId: context.tenantId,
+    actorUserId: context.userId,
+    actorUid: context.uid,
+    action: 'team.invite_revoked',
+    entityType: 'staff_invite',
+    entityId: inviteId,
+    inputSource: 'ui',
+    correlationId,
+  });
   return updated;
 }
 
@@ -517,8 +526,14 @@ export async function updateMemberRoleOrBranch(
       (m) => m.id === membershipId && m.tenantId === context.tenantId
     );
     if (!mem) throw new NotFoundError('Membership not found');
+    if (patch.branchId) {
+      const br = store.branches.find(
+        (b) => b.id === patch.branchId && b.tenantId === context.tenantId
+      );
+      if (!br) throw new NotFoundError('Branch not found');
+      mem.branchId = br.id;
+    }
     if (patch.role) mem.role = patch.role;
-    if (patch.branchId) mem.branchId = patch.branchId;
     if (patch.active !== undefined) {
       mem.active = patch.active;
       mem.revokedAt = patch.active ? null : new Date();
@@ -536,6 +551,15 @@ export async function updateMemberRoleOrBranch(
     return mem;
   }
 
+  if (patch.branchId) {
+    const [br] = await db
+      .select({ id: branches.id })
+      .from(branches)
+      .where(and(eq(branches.id, patch.branchId), eq(branches.tenantId, context.tenantId)))
+      .limit(1);
+    if (!br) throw new NotFoundError('Branch not found');
+  }
+
   const [updated] = await db
     .update(memberships)
     .set({
@@ -549,6 +573,19 @@ export async function updateMemberRoleOrBranch(
     .returning();
 
   if (!updated) throw new NotFoundError('Membership not found');
+
+  await db.insert(auditEvents).values({
+    tenantId: context.tenantId,
+    actorUserId: context.userId,
+    actorUid: context.uid,
+    action: 'team.membership_updated',
+    entityType: 'membership',
+    entityId: updated.id,
+    inputSource: 'ui',
+    correlationId,
+    metadataJson: patch as Record<string, unknown>,
+  });
+
   return updated;
 }
 
@@ -618,6 +655,18 @@ export async function setStaffShiftPin(
     });
   }
 
+  await db.insert(auditEvents).values({
+    tenantId: context.tenantId,
+    actorUserId: context.userId,
+    actorUid: context.uid,
+    action: 'team.shift_pin_set',
+    entityType: 'user',
+    entityId: String(context.userId),
+    inputSource: 'ui',
+    correlationId,
+    metadataJson: {},
+  });
+
   return { configured: true };
 }
 
@@ -636,6 +685,9 @@ export async function verifyStaffShiftPin(
     const member = store.memberships.find(
       (m) => m.tenantId === context.tenantId && m.userId === matched.userId && m.active
     );
+    if (!member) {
+      throw new ForbiddenError('Staff membership is inactive or revoked', 'MEMBERSHIP_REVOKED');
+    }
     const u = getMemoryUserById(matched.userId);
     addMemAuditEvent({
       tenantId: context.tenantId,
@@ -645,13 +697,13 @@ export async function verifyStaffShiftPin(
       entityType: 'user',
       entityId: String(matched.userId),
       correlationId,
-      metadataJson: { role: member?.role ?? context.role },
+      metadataJson: { role: member.role },
     });
     return {
       verified: true,
       userId: matched.userId,
       displayName: u?.displayName ?? 'Staff Member',
-      role: member?.role ?? context.role,
+      role: member.role,
     };
   }
 
@@ -676,10 +728,26 @@ export async function verifyStaffShiftPin(
     )
     .limit(1);
 
+  if (!mem) {
+    throw new ForbiddenError('Staff membership is inactive or revoked', 'MEMBERSHIP_REVOKED');
+  }
+
+  await db.insert(auditEvents).values({
+    tenantId: context.tenantId,
+    actorUserId: context.userId,
+    actorUid: context.uid,
+    action: 'team.shift_pin_unlocked',
+    entityType: 'user',
+    entityId: String(matched.userId),
+    inputSource: 'ui',
+    correlationId,
+    metadataJson: { role: mem.role },
+  });
+
   return {
     verified: true,
     userId: matched.userId,
-    displayName: mem?.displayName ?? 'Staff Member',
-    role: (mem?.role as Role) ?? context.role,
+    displayName: mem.displayName,
+    role: mem.role as Role,
   };
 }

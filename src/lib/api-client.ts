@@ -1,7 +1,9 @@
 import { auth } from './firebase.ts';
 import type {
   ApiErrorEnvelope,
+  AutopilotCockpitResponse,
   BillingCycle,
+  CompleteShiftChecklistInput,
   CreateBranchInput,
   CreateStaffInviteInput,
   JarvisConverseInput,
@@ -10,12 +12,19 @@ import type {
   OnboardingBootstrapInput,
   PaySubscriptionInvoiceInput,
   ProductMode,
+  PublicKioskInfoResponse,
+  PublicSelfCheckInInput,
+  PublicSelfCheckInResponse,
   SendNotificationInput,
   SessionContextResponse,
+  ShiftChecklistRunView,
   SubscriptionPaymentItem,
   SupportedLocale,
   TenantSubscriptionOverview,
   TodaySummaryResponse,
+  ToggleChecklistItemInput,
+  UpdateGovernanceRulesInput,
+  WorkspaceGovernanceRuleView,
   WorkspaceQuotaSummary,
 } from '../contracts/api.ts';
 import type {
@@ -753,6 +762,7 @@ export const apiClient = {
       }>;
       discountMinor: number;
       approvalId?: string | null;
+      managerOverridePin?: string;
       payments: Array<{
         method: 'cash' | 'card' | 'bank';
         amountMinor: number;
@@ -885,11 +895,12 @@ export const apiClient = {
 
   jarvisTts: (tenantId: string, payload: { text: string; locale: SupportedLocale }) =>
     authorizedFetch<{
-      mode: 'gemini_audio' | 'browser_tts';
+      mode: 'audio_wav' | 'browser_tts';
+      lang?: SupportedLocale;
       mimeType?: string;
       audioBase64?: string;
       text: string;
-      locale: SupportedLocale;
+      locale?: SupportedLocale;
       correlationId: string;
     }>('/assistant/tts', {
       method: 'POST',
@@ -938,7 +949,12 @@ export const apiClient = {
     tenantId: string,
     payload: { resourceId: string; delayMinutes: number }
   ) =>
-    authorizedFetch<{ updatedCount: number; delayMinutes: number; correlationId: string }>(
+    authorizedFetch<{
+      resourceId: string;
+      affectedTokens: number;
+      delayMinutes: number;
+      correlationId: string;
+    }>(
       '/clinic/queue/delay-broadcast',
       {
         method: 'POST',
@@ -1096,7 +1112,7 @@ export const apiClient = {
         fromBranchName: string;
         toBranchId: string;
         toBranchName: string;
-        status: 'in_transit' | 'received_quarantine' | 'received_sellable';
+        status: 'dispatched' | 'received';
         notes: string;
         createdAt: string;
         receivedAt: string | null;
@@ -1136,7 +1152,8 @@ export const apiClient = {
         id: string;
         orderNumber: string;
         personId: string;
-        personName: string;
+        patientName: string;
+        patientPhone?: string;
         appointmentId: string | null;
         prescriberName: string;
         clinicalNotes: string;
@@ -1460,6 +1477,147 @@ export const apiClient = {
       tenantId,
       body: JSON.stringify(payload),
     }),
+
+  fetchAccountsTaxSummaryCsv: async (tenantId: string, date?: string): Promise<string> => {
+    const currentUser = auth.currentUser;
+    if (!currentUser) throw new Error('Please sign in first.');
+    const token = await currentUser.getIdToken(false);
+    const qs = date ? `?date=${encodeURIComponent(date)}` : '';
+    const res = await fetch(`/api/v1/accounts/tax-summary.csv${qs}`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'X-Tenant-Id': tenantId,
+      },
+      cache: 'no-store',
+    });
+    if (!res.ok) {
+      throw new Error('Unable to download tax summary CSV.');
+    }
+    return res.text();
+  },
+
+  fetchSlipsBankPayrollCsv: async (tenantId: string, month?: string): Promise<string> => {
+    const currentUser = auth.currentUser;
+    if (!currentUser) throw new Error('Please sign in first.');
+    const token = await currentUser.getIdToken(false);
+    const qs = month ? `?month=${encodeURIComponent(month)}` : '';
+    const res = await fetch(`/api/v1/hr-admin/payroll/slips.csv${qs}`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'X-Tenant-Id': tenantId,
+      },
+      cache: 'no-store',
+    });
+    if (!res.ok) {
+      throw new Error('Unable to download SLIPS payroll CSV.');
+    }
+    return res.text();
+  },
+
+  // 0-to-100 Autopilot, SOP Checklists, Governance & Smart Auto-Reorder
+  getAutopilotCockpit: (tenantId: string, date?: string) => {
+    const qs = date ? `?date=${encodeURIComponent(date)}` : '';
+    return authorizedFetch<{ cockpit: AutopilotCockpitResponse; correlationId: string }>(
+      `/autopilot/cockpit${qs}`,
+      { tenantId }
+    );
+  },
+
+  updateGovernanceRules: (tenantId: string, payload: UpdateGovernanceRulesInput) =>
+    authorizedFetch<{ rules: WorkspaceGovernanceRuleView; correlationId: string }>(
+      '/autopilot/governance',
+      {
+        method: 'PUT',
+        tenantId,
+        body: JSON.stringify(payload),
+      }
+    ),
+
+  toggleChecklistItem: (
+    tenantId: string,
+    checklistId: string,
+    payload: ToggleChecklistItemInput
+  ) =>
+    authorizedFetch<{ checklist: ShiftChecklistRunView; correlationId: string }>(
+      `/autopilot/checklists/${checklistId}/toggle`,
+      {
+        method: 'POST',
+        tenantId,
+        body: JSON.stringify(payload),
+      }
+    ),
+
+  completeChecklist: (
+    tenantId: string,
+    checklistId: string,
+    payload: CompleteShiftChecklistInput
+  ) =>
+    authorizedFetch<{ checklist: ShiftChecklistRunView; correlationId: string }>(
+      `/autopilot/checklists/${checklistId}/complete`,
+      {
+        method: 'POST',
+        tenantId,
+        body: JSON.stringify(payload),
+      }
+    ),
+
+  generateAutoDraftPos: (tenantId: string) =>
+    authorizedFetch<{
+      createdCount: number;
+      purchaseOrders: Array<{
+        id: string;
+        poNumber: string;
+        supplierName: string;
+        totalEstimatedMinor: number;
+        lineCount: number;
+      }>;
+      correlationId: string;
+    }>('/autopilot/reorders/draft-pos', {
+      method: 'POST',
+      tenantId,
+    }),
+
+  generateOwnerBriefing: (tenantId: string, sendWhatsapp = true) =>
+    authorizedFetch<{
+      briefing: NonNullable<AutopilotCockpitResponse['latestBriefing']>;
+      correlationId: string;
+    }>('/autopilot/briefings/generate', {
+      method: 'POST',
+      tenantId,
+      body: JSON.stringify({ sendWhatsapp }),
+    }),
+
+  // Unauthenticated Public Patient QR Check-In Kiosk
+  getPublicKioskInfo: async (tenantSlug: string): Promise<PublicKioskInfoResponse> => {
+    const res = await fetch(`/api/v1/public/kiosk/${encodeURIComponent(tenantSlug)}`, {
+      cache: 'no-store',
+    });
+    const body = await res.json();
+    if (!res.ok) {
+      throw new ApiClientError(res.status, body as ApiErrorEnvelope);
+    }
+    return body.kiosk as PublicKioskInfoResponse;
+  },
+
+  submitPublicSelfCheckIn: async (
+    tenantSlug: string,
+    payload: PublicSelfCheckInInput
+  ): Promise<PublicSelfCheckInResponse> => {
+    const res = await fetch(
+      `/api/v1/public/kiosk/${encodeURIComponent(tenantSlug)}/checkin`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        cache: 'no-store',
+      }
+    );
+    const body = await res.json();
+    if (!res.ok) {
+      throw new ApiClientError(res.status, body as ApiErrorEnvelope);
+    }
+    return body.checkin as PublicSelfCheckInResponse;
+  },
 };
 
 export function formatLkrMinor(amountMinor: number, currency = 'LKR'): string {
@@ -1477,4 +1635,22 @@ export function formatTimeColombo(isoTimestamp: string, timezone = 'Asia/Colombo
     minute: '2-digit',
     hour12: true,
   }).format(new Date(isoTimestamp));
+}
+
+export function todayColomboDate(date = new Date()): string {
+  const shifted = new Date(date.getTime() + 330 * 60_000);
+  const y = shifted.getUTCFullYear();
+  const m = String(shifted.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(shifted.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+export function toColomboDatetimeLocal(date = new Date()): string {
+  const shifted = new Date(date.getTime() + 330 * 60_000);
+  const y = shifted.getUTCFullYear();
+  const m = String(shifted.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(shifted.getUTCDate()).padStart(2, '0');
+  const hh = String(shifted.getUTCHours()).padStart(2, '0');
+  const mm = String(shifted.getUTCMinutes()).padStart(2, '0');
+  return `${y}-${m}-${d}T${hh}:${mm}`;
 }

@@ -236,12 +236,19 @@ export async function createPurchaseOrder(
   }
 
   return db.transaction(async (tx) => {
+    const [sup] = await tx
+      .select({ id: suppliers.id })
+      .from(suppliers)
+      .where(and(eq(suppliers.id, input.supplierId), eq(suppliers.tenantId, context.tenantId)))
+      .limit(1);
+    if (!sup) throw new NotFoundError('Supplier not found');
+
     const [po] = await tx
       .insert(purchaseOrders)
       .values({
         tenantId: context.tenantId,
         branchId: context.branchId,
-        supplierId: input.supplierId,
+        supplierId: sup.id,
         poNumber,
         status: 'draft',
         expectedDate,
@@ -261,6 +268,18 @@ export async function createPurchaseOrder(
         estimatedUnitPackCostMinor: l.estimatedUnitPackCostMinor,
       }))
     );
+
+    await tx.insert(auditEvents).values({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'purchasing.po_created',
+      entityType: 'purchase_order',
+      entityId: po.id,
+      inputSource: 'ui',
+      correlationId,
+      metadataJson: { poNumber, totalEstimatedMinor, lineCount: input.lines.length },
+    });
 
     return { purchaseOrder: po };
   });
@@ -298,13 +317,43 @@ export async function approvePurchaseOrder(
     return { purchaseOrder: po };
   }
 
-  const [updated] = await db
-    .update(purchaseOrders)
-    .set({ status: 'approved', approvedByUserId: context.userId, approvedAt: new Date() })
-    .where(and(eq(purchaseOrders.id, poId), eq(purchaseOrders.tenantId, context.tenantId)))
-    .returning();
-  if (!updated) throw new NotFoundError('Purchase order not found');
-  return { purchaseOrder: updated };
+  return db.transaction(async (tx) => {
+    const [existing] = await tx
+      .select()
+      .from(purchaseOrders)
+      .where(
+        and(
+          eq(purchaseOrders.id, poId),
+          eq(purchaseOrders.tenantId, context.tenantId),
+          eq(purchaseOrders.branchId, context.branchId)
+        )
+      )
+      .limit(1);
+    if (!existing) throw new NotFoundError('Purchase order not found');
+    if (existing.status !== 'draft') {
+      throw new ConflictError('Only draft purchase orders can be approved');
+    }
+
+    const [updated] = await tx
+      .update(purchaseOrders)
+      .set({ status: 'approved', approvedByUserId: context.userId, approvedAt: new Date() })
+      .where(and(eq(purchaseOrders.id, poId), eq(purchaseOrders.tenantId, context.tenantId)))
+      .returning();
+
+    await tx.insert(auditEvents).values({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'purchasing.po_approved',
+      entityType: 'purchase_order',
+      entityId: updated.id,
+      inputSource: 'ui',
+      correlationId,
+      metadataJson: { poNumber: updated.poNumber },
+    });
+
+    return { purchaseOrder: updated };
+  });
 }
 
 export async function convertPurchaseOrderToGrn(
@@ -323,6 +372,9 @@ export async function convertPurchaseOrderToGrn(
   if (!po) throw new NotFoundError('Purchase order not found');
   if (po.status === 'received') throw new ConflictError('Purchase order has already been received');
   if (po.status === 'cancelled') throw new ConflictError('Cannot receive a cancelled purchase order');
+  if (po.status !== 'approved') {
+    throw new ConflictError('Purchase order must be approved before converting to GRN');
+  }
   if (po.lines.length === 0) throw new ValidationError('Purchase order has no line items');
 
   const receivedDate = getBusinessDateInTimezone(context.timezone);
@@ -359,16 +411,40 @@ export async function convertPurchaseOrderToGrn(
 
   if (!isDatabaseConfigured) {
     const store = getMemoryStore();
-    const targetPo = store.purchaseOrders.find((p) => p.id === po.id);
+    const targetPo = store.purchaseOrders.find(
+      (p) => p.tenantId === context.tenantId && p.id === po.id
+    );
     if (targetPo) {
       targetPo.status = 'received';
       targetPo.convertedGrnId = grnId;
     }
+    addMemAuditEvent({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'purchasing.po_converted_to_grn',
+      entityType: 'purchase_order',
+      entityId: po.id,
+      correlationId,
+      metadataJson: { poNumber: po.poNumber, convertedGrnId: grnId },
+    });
   } else {
     await db
       .update(purchaseOrders)
       .set({ status: 'received', convertedGrnId: grnId })
-      .where(eq(purchaseOrders.id, po.id));
+      .where(and(eq(purchaseOrders.tenantId, context.tenantId), eq(purchaseOrders.id, po.id)));
+
+    await db.insert(auditEvents).values({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'purchasing.po_converted_to_grn',
+      entityType: 'purchase_order',
+      entityId: po.id,
+      inputSource: 'ui',
+      correlationId,
+      metadataJson: { poNumber: po.poNumber, convertedGrnId: grnId },
+    });
   }
 
   return { poNumber: po.poNumber, convertedGrnId: grnId, grnResult };
@@ -389,6 +465,11 @@ export async function createSupplierDebitNote(
 
   if (!isDatabaseConfigured) {
     const store = getMemoryStore();
+    const sup = store.suppliers.find(
+      (s) => s.id === input.supplierId && s.tenantId === context.tenantId
+    );
+    if (!sup) throw new NotFoundError('Supplier not found');
+
     const bal = store.inventoryBalances.find(
       (b) =>
         b.tenantId === context.tenantId &&
@@ -402,20 +483,17 @@ export async function createSupplierDebitNote(
       throw new ValidationError(`Only ${available} base units available to return in this batch`);
     }
 
-    if (bal.quarantineQty >= input.qtyBase) {
-      bal.quarantineQty -= input.qtyBase;
-    } else {
-      const rem = input.qtyBase - bal.quarantineQty;
-      bal.quarantineQty = 0;
-      bal.sellableOnHand = Math.max(0, bal.sellableOnHand - rem);
-    }
+    const fromQuarantine = Math.min(bal.quarantineQty, input.qtyBase);
+    const fromSellable = input.qtyBase - fromQuarantine;
+    bal.quarantineQty -= fromQuarantine;
+    bal.sellableOnHand = Math.max(0, bal.sellableOnHand - fromSellable);
     bal.updatedAt = new Date();
 
     const note = {
       id: crypto.randomUUID(),
       tenantId: context.tenantId,
       branchId: context.branchId,
-      supplierId: input.supplierId,
+      supplierId: sup.id,
       debitNoteNumber,
       reason: input.reason,
       amountMinor,
@@ -429,28 +507,54 @@ export async function createSupplierDebitNote(
     };
     store.supplierDebitNotes.unshift(note);
 
-    store.stockMovements.push({
-      id: crypto.randomUUID(),
-      tenantId: context.tenantId,
-      branchId: context.branchId,
-      locationId: bal.locationId,
-      productId: input.productId,
-      lotId: input.lotId,
-      costLayerId: null,
-      movementType: 'supplier_return',
-      qtyBase: input.qtyBase,
-      fromBucket: 'sellable',
-      toBucket: 'supplier',
-      reason: `Supplier Debit Note ${debitNoteNumber} (${input.reason})`,
-      sourceDocType: 'supplier_debit_note',
-      sourceDocId: note.id,
-      commandId: null,
-      packVariantId: null,
-      uomConversionVersion: null,
-      actorUserId: context.userId,
-      occurredAt: new Date(),
-      createdAt: new Date(),
-    });
+    if (fromQuarantine > 0) {
+      store.stockMovements.push({
+        id: crypto.randomUUID(),
+        tenantId: context.tenantId,
+        branchId: context.branchId,
+        locationId: bal.locationId,
+        productId: input.productId,
+        lotId: input.lotId,
+        costLayerId: null,
+        movementType: 'supplier_return',
+        qtyBase: fromQuarantine,
+        fromBucket: 'quarantine',
+        toBucket: 'supplier',
+        reason: `Supplier Debit Note ${debitNoteNumber} (${input.reason})`,
+        sourceDocType: 'supplier_debit_note',
+        sourceDocId: note.id,
+        commandId: null,
+        packVariantId: null,
+        uomConversionVersion: null,
+        actorUserId: context.userId,
+        occurredAt: new Date(),
+        createdAt: new Date(),
+      });
+    }
+    if (fromSellable > 0) {
+      store.stockMovements.push({
+        id: crypto.randomUUID(),
+        tenantId: context.tenantId,
+        branchId: context.branchId,
+        locationId: bal.locationId,
+        productId: input.productId,
+        lotId: input.lotId,
+        costLayerId: null,
+        movementType: 'supplier_return',
+        qtyBase: fromSellable,
+        fromBucket: 'sellable',
+        toBucket: 'supplier',
+        reason: `Supplier Debit Note ${debitNoteNumber} (${input.reason})`,
+        sourceDocType: 'supplier_debit_note',
+        sourceDocId: note.id,
+        commandId: null,
+        packVariantId: null,
+        uomConversionVersion: null,
+        actorUserId: context.userId,
+        occurredAt: new Date(),
+        createdAt: new Date(),
+      });
+    }
 
     addMemAuditEvent({
       tenantId: context.tenantId,
@@ -460,13 +564,20 @@ export async function createSupplierDebitNote(
       entityType: 'supplier_debit_note',
       entityId: note.id,
       correlationId,
-      metadataJson: { debitNoteNumber, amountMinor, qtyBase: input.qtyBase },
+      metadataJson: { debitNoteNumber, amountMinor, qtyBase: input.qtyBase, fromQuarantine, fromSellable },
     });
 
     return { debitNote: note };
   }
 
   return db.transaction(async (tx) => {
+    const [sup] = await tx
+      .select({ id: suppliers.id })
+      .from(suppliers)
+      .where(and(eq(suppliers.id, input.supplierId), eq(suppliers.tenantId, context.tenantId)))
+      .limit(1);
+    if (!sup) throw new NotFoundError('Supplier not found');
+
     const [bal] = await tx
       .select()
       .from(inventoryBalances)
@@ -478,6 +589,7 @@ export async function createSupplierDebitNote(
           eq(inventoryBalances.lotId, input.lotId)
         )
       )
+      .for('update')
       .limit(1);
     if (!bal) throw new NotFoundError('Stock balance for specified product lot not found');
 
@@ -486,15 +598,10 @@ export async function createSupplierDebitNote(
       throw new ValidationError(`Only ${available} base units available to return in this batch`);
     }
 
-    let nextQuarantine = bal.quarantineQty;
-    let nextSellable = bal.sellableOnHand;
-    if (nextQuarantine >= input.qtyBase) {
-      nextQuarantine -= input.qtyBase;
-    } else {
-      const rem = input.qtyBase - nextQuarantine;
-      nextQuarantine = 0;
-      nextSellable = Math.max(0, nextSellable - rem);
-    }
+    const fromQuarantine = Math.min(bal.quarantineQty, input.qtyBase);
+    const fromSellable = input.qtyBase - fromQuarantine;
+    const nextQuarantine = bal.quarantineQty - fromQuarantine;
+    const nextSellable = Math.max(0, bal.sellableOnHand - fromSellable);
 
     await tx
       .update(inventoryBalances)
@@ -506,7 +613,7 @@ export async function createSupplierDebitNote(
       .values({
         tenantId: context.tenantId,
         branchId: context.branchId,
-        supplierId: input.supplierId,
+        supplierId: sup.id,
         debitNoteNumber,
         reason: input.reason,
         amountMinor,
@@ -519,20 +626,51 @@ export async function createSupplierDebitNote(
       })
       .returning();
 
-    await tx.insert(stockMovements).values({
+    if (fromQuarantine > 0) {
+      await tx.insert(stockMovements).values({
+        tenantId: context.tenantId,
+        branchId: context.branchId,
+        locationId: bal.locationId,
+        productId: input.productId,
+        lotId: input.lotId,
+        movementType: 'supplier_return',
+        qtyBase: fromQuarantine,
+        fromBucket: 'quarantine',
+        toBucket: 'supplier',
+        reason: `Supplier Debit Note ${debitNoteNumber} (${input.reason})`,
+        sourceDocType: 'supplier_debit_note',
+        sourceDocId: note.id,
+        actorUserId: context.userId,
+      });
+    }
+    if (fromSellable > 0) {
+      await tx.insert(stockMovements).values({
+        tenantId: context.tenantId,
+        branchId: context.branchId,
+        locationId: bal.locationId,
+        productId: input.productId,
+        lotId: input.lotId,
+        movementType: 'supplier_return',
+        qtyBase: fromSellable,
+        fromBucket: 'sellable',
+        toBucket: 'supplier',
+        reason: `Supplier Debit Note ${debitNoteNumber} (${input.reason})`,
+        sourceDocType: 'supplier_debit_note',
+        sourceDocId: note.id,
+        actorUserId: context.userId,
+      });
+    }
+
+    await tx.insert(auditEvents).values({
       tenantId: context.tenantId,
-      branchId: context.branchId,
-      locationId: bal.locationId,
-      productId: input.productId,
-      lotId: input.lotId,
-      movementType: 'supplier_return',
-      qtyBase: input.qtyBase,
-      fromBucket: 'sellable',
-      toBucket: 'supplier',
-      reason: `Supplier Debit Note ${debitNoteNumber} (${input.reason})`,
-      sourceDocType: 'supplier_debit_note',
-      sourceDocId: note.id,
       actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'purchasing.supplier_debit_note_created',
+      entityType: 'supplier_debit_note',
+      entityId: note.id,
+      inputSource: 'ui',
+      correlationId,
+      metadataJson: { debitNoteNumber, amountMinor, qtyBase: input.qtyBase, fromQuarantine, fromSellable },
     });
 
     return { debitNote: note };

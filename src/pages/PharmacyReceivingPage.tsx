@@ -3,7 +3,12 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Barcode, FileText, Truck } from 'lucide-react';
 import { useAuth } from '../context/AuthContext.tsx';
-import { apiClient, ApiClientError, formatLkrMinor } from '../lib/api-client.ts';
+import {
+  apiClient,
+  ApiClientError,
+  formatLkrMinor,
+  todayColomboDate,
+} from '../lib/api-client.ts';
 
 export function PharmacyReceivingPage() {
   const { activeTenantId } = useAuth();
@@ -22,7 +27,7 @@ export function PharmacyReceivingPage() {
   const [supplierId, setSupplierId] = useState('');
   const [supplierDocRef, setSupplierDocRef] = useState('');
   const [docType, setDocType] = useState<'grn' | 'opening_balance'>('grn');
-  const [receivedDate, setReceivedDate] = useState(new Date().toISOString().slice(0, 10));
+  const [receivedDate, setReceivedDate] = useState(() => todayColomboDate());
   const [selectedVariantKey, setSelectedVariantKey] = useState(''); // "productId|variantId"
   const [batchNumber, setBatchNumber] = useState('');
   const [printedExpiry, setPrintedExpiry] = useState('2027-12');

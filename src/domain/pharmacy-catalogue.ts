@@ -228,6 +228,8 @@ export async function createProduct(
       storageCondition: input.storageCondition,
       baseUnit: input.baseUnit,
       minShelfLifeDays: input.minShelfLifeDays,
+      reorderPointBase: input.reorderPointBase ?? 50,
+      targetParBase: input.targetParBase ?? 200,
       active: true,
       createdAt: now,
       updatedAt: now,
@@ -351,6 +353,8 @@ export async function createProduct(
         storageCondition: input.storageCondition,
         baseUnit: input.baseUnit,
         minShelfLifeDays: input.minShelfLifeDays,
+        reorderPointBase: input.reorderPointBase ?? 50,
+        targetParBase: input.targetParBase ?? 200,
       })
       .returning();
 

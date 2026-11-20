@@ -676,6 +676,16 @@ export async function bootstrapClinicWorkspace(
         active: true,
       });
 
+      store.doctorCommissionRules.push({
+        id: crypto.randomUUID(),
+        tenantId,
+        resourceId: primaryResourceId,
+        serviceId: null,
+        doctorSharePercent: 75,
+        clinicSharePercent: 25,
+        updatedAt: now,
+      });
+
       if (input.includeSampleData && insertedServices.length > 0) {
         const primaryService = insertedServices[0];
         const nimalId = crypto.randomUUID();

@@ -629,4 +629,180 @@ export interface JarvisConverseResponse {
   modelVersion: string;
 }
 
+// Silicon Valley 0-to-100 Autopilot, Governance, Checklists & Public Kiosk Contracts
+export const UpdateGovernanceRulesSchema = z.object({
+  maxCashierDiscountPercent: z.number().int().min(0).max(100),
+  maxExpenseWithoutPinMinor: z.number().int().min(0).max(100_000_000),
+  maxStockWriteoffWithoutPin: z.number().int().min(0).max(100_000),
+  requireClosingChecklist: z.boolean(),
+  autoReorderEnabled: z.boolean(),
+  ownerDigestEnabled: z.boolean(),
+  ownerWhatsappPhone: z.string().trim().max(30).optional().default(''),
+});
+export type UpdateGovernanceRulesInput = z.infer<typeof UpdateGovernanceRulesSchema>;
 
+export const ToggleChecklistItemSchema = z.object({
+  itemKey: z.string().trim().min(2).max(80),
+  completed: z.boolean(),
+});
+export type ToggleChecklistItemInput = z.infer<typeof ToggleChecklistItemSchema>;
+
+export const CompleteShiftChecklistSchema = z.object({
+  cashDrawerCountLkr: z.number().min(0).max(500_000_000).optional().nullable(),
+  handoverNotes: z.string().trim().max(500).optional().default(''),
+});
+export type CompleteShiftChecklistInput = z.infer<typeof CompleteShiftChecklistSchema>;
+
+export const PublicSelfCheckInSchema = z.object({
+  branchId: z.string().uuid().optional(),
+  patientName: z.string().trim().min(2).max(120),
+  phone: z.string().trim().min(7).max(24),
+  serviceId: z.string().uuid(),
+  resourceId: z.string().uuid(),
+  notes: z.string().trim().max(300).optional().default(''),
+});
+export type PublicSelfCheckInInput = z.infer<typeof PublicSelfCheckInSchema>;
+
+export interface WorkspaceGovernanceRuleView {
+  maxCashierDiscountPercent: number;
+  maxExpenseWithoutPinMinor: number;
+  maxStockWriteoffWithoutPin: number;
+  requireClosingChecklist: boolean;
+  autoReorderEnabled: boolean;
+  ownerDigestEnabled: boolean;
+  ownerWhatsappPhone: string;
+  updatedAt: string;
+}
+
+export interface ShiftChecklistRunView {
+  id: string;
+  businessDate: string;
+  shiftType: 'opening' | 'closing';
+  status: 'in_progress' | 'completed';
+  items: Array<{
+    key: string;
+    labelEn: string;
+    labelSi: string;
+    category: 'cash' | 'safety' | 'clinic' | 'pharmacy';
+    required: boolean;
+    completed: boolean;
+    completedByName: string;
+    completedAt: string | null;
+  }>;
+  completedCount: number;
+  totalCount: number;
+  handoverNotes: string;
+  cashDrawerCountMinor: number | null;
+  completedByName: string;
+  completedAt: string | null;
+}
+
+export interface AutopilotAnomalyItem {
+  id: string;
+  code: string;
+  severity: 'info' | 'warning' | 'critical';
+  category: string;
+  titleEn: string;
+  titleSi: string;
+  detail: string;
+  metricValue: string;
+  actionPath: string;
+}
+
+export interface SmartReorderSuggestionItem {
+  productId: string;
+  skuCode: string;
+  productName: string;
+  baseUnit: string;
+  sellableOnHand: number;
+  avgDailyUsage: number;
+  dynamicReorderPoint: number;
+  targetParBase: number;
+  suggestedOrderBase: number;
+  preferredSupplierId: string | null;
+  preferredSupplierName: string;
+  packVariantId: string | null;
+  variantName: string;
+  packUnit: string;
+  suggestedOrderPacks: number;
+  estimatedPackCostMinor: number;
+}
+
+export interface AutopilotCockpitResponse {
+  businessDate: string;
+  currency: string;
+  tenantSlug: string;
+  kioskPath: string;
+  modeFlags: { hasClinic: boolean; hasPharmacy: boolean };
+  governance: WorkspaceGovernanceRuleView;
+  checklists: {
+    opening: ShiftChecklistRunView;
+    closing: ShiftChecklistRunView;
+  };
+  anomalies: AutopilotAnomalyItem[];
+  smartReorders: SmartReorderSuggestionItem[];
+  latestBriefing: {
+    id: string;
+    businessDate: string;
+    summaryTextEn: string;
+    summaryTextSi: string;
+    anomalyCount: number;
+    dispatchedChannel: 'in_app' | 'whatsapp';
+    createdAt: string;
+    metricsJson: Record<string, unknown>;
+  } | null;
+  soloSnapshot: {
+    totalAppointmentsToday: number;
+    waitingAppointmentsCount: number;
+    nextWaitingPatient: {
+      appointmentId: string;
+      personName: string;
+      tokenNumber: number | null;
+      status: string;
+    } | null;
+    clinicCollectionsMinor: number;
+    pharmacyNetSalesMinor: number;
+    operatingExpensesMinor: number;
+    todayRevenueMinor: number;
+    trueNetProfitMinor: number;
+    lowStockCount: number;
+    expiringSoonCount: number;
+  };
+}
+
+export interface PublicKioskInfoResponse {
+  tenantId: string;
+  tenantSlug: string;
+  tenantName: string;
+  branchId: string;
+  branchName: string;
+  timezone: string;
+  currency: string;
+  businessDate: string;
+  waitingCount: number;
+  estimatedWaitMinutes: number;
+  services: Array<{
+    id: string;
+    name: string;
+    nameSi: string;
+    durationMinutes: number;
+    priceMinor: number;
+  }>;
+  resources: Array<{
+    id: string;
+    name: string;
+    specialty: string;
+  }>;
+}
+
+export interface PublicSelfCheckInResponse {
+  appointmentId: string;
+  tokenNumber: number;
+  startsAt: string;
+  businessDate: string;
+  clinicName: string;
+  branchName: string;
+  doctorName: string;
+  serviceName: string;
+  patientName: string;
+}

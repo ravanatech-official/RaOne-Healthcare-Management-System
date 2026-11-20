@@ -765,7 +765,7 @@ export function PharmacyStockPage() {
                           .join(', ')}
                       </div>
                     </div>
-                    {trf.status === 'in_transit' && (
+                    {trf.status === 'dispatched' && (
                       <div className="flex gap-2">
                         <button
                           type="button"

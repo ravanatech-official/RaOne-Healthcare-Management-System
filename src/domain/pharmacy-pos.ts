@@ -35,6 +35,7 @@ import type {
   PosCartItemInput,
   TillCashEventInput,
 } from '../contracts/pharmacy.ts';
+import { assertGovernancePinIfRequired } from './autopilot-ops.ts';
 import { assertProfessionalGrant } from './capabilities.ts';
 import { ConflictError, NotFoundError, ValidationError } from './errors.ts';
 import { addMemAuditEvent, getMemoryStore } from './memory-store.ts';
@@ -542,6 +543,17 @@ export async function checkoutPosSale(
     });
 
     if (input.discountMinor > subtotalMinor) throw new ValidationError('Discount cannot exceed subtotal');
+    const discountPercent =
+      subtotalMinor > 0 ? Math.round((input.discountMinor / subtotalMinor) * 100) : 0;
+    await assertGovernancePinIfRequired(
+      context,
+      {
+        type: 'pos_discount',
+        discountPercent,
+        managerOverridePin: input.managerOverridePin,
+      },
+      correlationId
+    );
     const totalMinor = subtotalMinor - input.discountMinor;
     const paidMinor = input.payments.reduce((acc, p) => acc + p.amountMinor, 0);
     if (paidMinor < totalMinor) {
@@ -693,7 +705,7 @@ export async function checkoutPosSale(
     for (const p of input.payments) {
       store.posPayments.push({
         id: crypto.randomUUID(), tenantId: context.tenantId, saleId: sale.id,
-        method: p.method, amountMinor: p.amountMinor, referenceNumber: p.referenceNumber.trim(), createdAt: now,
+        method: p.method, amountMinor: p.amountMinor, referenceNumber: (p.referenceNumber ?? '').trim(), createdAt: now,
       });
       if (p.method === 'cash') cashInDrawerDelta += p.amountMinor;
     }
@@ -832,6 +844,17 @@ export async function checkoutPosSale(
     if (input.discountMinor > subtotalMinor) {
       throw new ValidationError('Discount cannot exceed subtotal');
     }
+    const discountPercent =
+      subtotalMinor > 0 ? Math.round((input.discountMinor / subtotalMinor) * 100) : 0;
+    await assertGovernancePinIfRequired(
+      context,
+      {
+        type: 'pos_discount',
+        discountPercent,
+        managerOverridePin: input.managerOverridePin,
+      },
+      correlationId
+    );
     const totalMinor = subtotalMinor - input.discountMinor;
     const paidMinor = input.payments.reduce((acc, p) => acc + p.amountMinor, 0);
     if (paidMinor < totalMinor) {
@@ -1132,7 +1155,7 @@ export async function checkoutPosSale(
         saleId: sale.id,
         method: p.method,
         amountMinor: p.amountMinor,
-        referenceNumber: p.referenceNumber.trim(),
+        referenceNumber: (p.referenceNumber ?? '').trim(),
       });
       if (p.method === 'cash') {
         cashInDrawerDelta += p.amountMinor;
@@ -1351,20 +1374,92 @@ export async function createPosReturn(
     const saleLines = store.posSaleLines.filter((l) => l.tenantId === context.tenantId && l.saleId === sale.id);
     const allocs = store.posSaleAllocations.filter((a) => a.tenantId === context.tenantId && a.saleId === sale.id);
 
-    let totalRefundMinor = 0;
-    const returnItemsPrep = input.lines.map((reqLine) => {
+    const priorReturns = store.posReturns.filter(
+      (r) => r.tenantId === context.tenantId && r.saleId === sale.id
+    );
+    const priorRefundedMinor = priorReturns.reduce((s, r) => s + r.refundAmountMinor, 0);
+
+    const requestedByLine = new Map<string, number>();
+    let rawTotalRefundMinor = 0;
+    const returnItemsPrep: Array<{
+      saleLine: (typeof saleLines)[number];
+      qtyBase: number;
+      refundMinor: number;
+      lotId: string;
+      storageLocationId: string;
+    }> = [];
+
+    for (const reqLine of input.lines) {
+      if (reqLine.qtyBase <= 0) {
+        throw new ValidationError('Return quantity must be positive');
+      }
       const saleLine = saleLines.find((l) => l.id === reqLine.saleLineId);
       if (!saleLine) throw new NotFoundError('POS sale line not found');
-      const remainingReturnable = saleLine.qtyBase - saleLine.returnedQtyBase;
+
+      const priorBatchQty = requestedByLine.get(saleLine.id) ?? 0;
+      const remainingReturnable = saleLine.qtyBase - saleLine.returnedQtyBase - priorBatchQty;
       if (reqLine.qtyBase > remainingReturnable) {
-        throw new ConflictError(`Return quantity (${reqLine.qtyBase}) exceeds remaining returnable quantity (${remainingReturnable})`);
+        throw new ConflictError(
+          `Return quantity (${reqLine.qtyBase}) exceeds remaining returnable quantity (${remainingReturnable})`
+        );
       }
-      const lineAlloc = allocs.find((a) => a.saleLineId === saleLine.id);
-      if (!lineAlloc) throw new NotFoundError('Original lot allocation for sale line not found');
-      const refundMinor = Math.round((saleLine.lineTotalMinor * reqLine.qtyBase) / saleLine.qtyBase);
-      totalRefundMinor += refundMinor;
-      return { saleLine, qtyBase: reqLine.qtyBase, refundMinor, lotId: lineAlloc.lotId, storageLocationId: lineAlloc.storageLocationId };
-    });
+      requestedByLine.set(saleLine.id, priorBatchQty + reqLine.qtyBase);
+
+      const lineAllocs = allocs.filter((a) => a.saleLineId === saleLine.id);
+      if (lineAllocs.length === 0) {
+        throw new NotFoundError('Original lot allocation for sale line not found');
+      }
+
+      const rawLineRefundMinor = Math.round((saleLine.lineTotalMinor * reqLine.qtyBase) / saleLine.qtyBase);
+      rawTotalRefundMinor += rawLineRefundMinor;
+
+      let offset = saleLine.returnedQtyBase + priorBatchQty;
+      let remainingToAllocate = reqLine.qtyBase;
+      const lineChunks: Array<{ lotId: string; storageLocationId: string; qtyBase: number }> = [];
+      for (const a of lineAllocs) {
+        const skip = Math.min(a.qtyBase, offset);
+        offset -= skip;
+        const availableCap = a.qtyBase - skip;
+        if (availableCap <= 0 || remainingToAllocate <= 0) continue;
+        const take = Math.min(availableCap, remainingToAllocate);
+        lineChunks.push({ lotId: a.lotId, storageLocationId: a.storageLocationId, qtyBase: take });
+        remainingToAllocate -= take;
+        if (remainingToAllocate <= 0) break;
+      }
+      if (remainingToAllocate > 0) {
+        throw new NotFoundError('Original lot allocation for sale line not found');
+      }
+
+      let allocatedRefund = 0;
+      lineChunks.forEach((chunk, idx) => {
+        const isLast = idx === lineChunks.length - 1;
+        const chunkRefund = isLast
+          ? rawLineRefundMinor - allocatedRefund
+          : Math.round((rawLineRefundMinor * chunk.qtyBase) / reqLine.qtyBase);
+        allocatedRefund += chunkRefund;
+        returnItemsPrep.push({
+          saleLine,
+          qtyBase: chunk.qtyBase,
+          refundMinor: chunkRefund,
+          lotId: chunk.lotId,
+          storageLocationId: chunk.storageLocationId,
+        });
+      });
+    }
+
+    const maxRemainingRefundMinor = Math.max(0, sale.totalMinor - priorRefundedMinor);
+    const totalRefundMinor = Math.min(rawTotalRefundMinor, maxRemainingRefundMinor);
+    if (totalRefundMinor < rawTotalRefundMinor && rawTotalRefundMinor > 0 && returnItemsPrep.length > 0) {
+      let runningScaled = 0;
+      returnItemsPrep.forEach((item, idx) => {
+        const isLast = idx === returnItemsPrep.length - 1;
+        const scaled = isLast
+          ? totalRefundMinor - runningScaled
+          : Math.round((item.refundMinor * totalRefundMinor) / rawTotalRefundMinor);
+        item.refundMinor = scaled;
+        runningScaled += scaled;
+      });
+    }
 
     const businessDate = getBusinessDateInTimezone(context.timezone);
     const returnNumber = `RET-${businessDate.replace(/-/g, '')}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
@@ -1487,7 +1582,14 @@ export async function createPosReturn(
         and(eq(posSaleAllocations.tenantId, context.tenantId), eq(posSaleAllocations.saleId, sale.id))
       );
 
-    let totalRefundMinor = 0;
+    const priorReturns = await tx
+      .select({ refundAmountMinor: posReturns.refundAmountMinor })
+      .from(posReturns)
+      .where(and(eq(posReturns.tenantId, context.tenantId), eq(posReturns.saleId, sale.id)));
+    const priorRefundedMinor = priorReturns.reduce((s, r) => s + r.refundAmountMinor, 0);
+
+    const requestedByLine = new Map<string, number>();
+    let rawTotalRefundMinor = 0;
     const returnItemsPrep: Array<{
       saleLine: (typeof saleLines)[number];
       qtyBase: number;
@@ -1497,30 +1599,73 @@ export async function createPosReturn(
     }> = [];
 
     for (const reqLine of input.lines) {
+      if (reqLine.qtyBase <= 0) {
+        throw new ValidationError('Return quantity must be positive');
+      }
       const saleLine = lineMap.get(reqLine.saleLineId);
       if (!saleLine) throw new NotFoundError('POS sale line not found');
-      const remainingReturnable = saleLine.qtyBase - saleLine.returnedQtyBase;
+      const priorBatchQty = requestedByLine.get(saleLine.id) ?? 0;
+      const remainingReturnable = saleLine.qtyBase - saleLine.returnedQtyBase - priorBatchQty;
       if (reqLine.qtyBase > remainingReturnable) {
         throw new ConflictError(
           `Return quantity (${reqLine.qtyBase}) exceeds remaining returnable quantity (${remainingReturnable})`
         );
       }
+      requestedByLine.set(saleLine.id, priorBatchQty + reqLine.qtyBase);
 
-      const lineAlloc = allocs.find((a) => a.saleLineId === saleLine.id);
-      if (!lineAlloc) {
+      const lineAllocs = allocs.filter((a) => a.saleLineId === saleLine.id);
+      if (lineAllocs.length === 0) {
         throw new NotFoundError('Original lot allocation for sale line not found');
       }
 
-      // Proportional minor-unit refund
-      const refundMinor = Math.round((saleLine.lineTotalMinor * reqLine.qtyBase) / saleLine.qtyBase);
-      totalRefundMinor += refundMinor;
+      const rawLineRefundMinor = Math.round((saleLine.lineTotalMinor * reqLine.qtyBase) / saleLine.qtyBase);
+      rawTotalRefundMinor += rawLineRefundMinor;
 
-      returnItemsPrep.push({
-        saleLine,
-        qtyBase: reqLine.qtyBase,
-        refundMinor,
-        lotId: lineAlloc.lotId,
-        storageLocationId: lineAlloc.storageLocationId,
+      let offset = saleLine.returnedQtyBase + priorBatchQty;
+      let remainingToAllocate = reqLine.qtyBase;
+      const lineChunks: Array<{ lotId: string; storageLocationId: string; qtyBase: number }> = [];
+      for (const a of lineAllocs) {
+        const skip = Math.min(a.qtyBase, offset);
+        offset -= skip;
+        const availableCap = a.qtyBase - skip;
+        if (availableCap <= 0 || remainingToAllocate <= 0) continue;
+        const take = Math.min(availableCap, remainingToAllocate);
+        lineChunks.push({ lotId: a.lotId, storageLocationId: a.storageLocationId, qtyBase: take });
+        remainingToAllocate -= take;
+        if (remainingToAllocate <= 0) break;
+      }
+      if (remainingToAllocate > 0) {
+        throw new NotFoundError('Original lot allocation for sale line not found');
+      }
+
+      let allocatedRefund = 0;
+      lineChunks.forEach((chunk, idx) => {
+        const isLast = idx === lineChunks.length - 1;
+        const chunkRefund = isLast
+          ? rawLineRefundMinor - allocatedRefund
+          : Math.round((rawLineRefundMinor * chunk.qtyBase) / reqLine.qtyBase);
+        allocatedRefund += chunkRefund;
+        returnItemsPrep.push({
+          saleLine,
+          qtyBase: chunk.qtyBase,
+          refundMinor: chunkRefund,
+          lotId: chunk.lotId,
+          storageLocationId: chunk.storageLocationId,
+        });
+      });
+    }
+
+    const maxRemainingRefundMinor = Math.max(0, sale.totalMinor - priorRefundedMinor);
+    const totalRefundMinor = Math.min(rawTotalRefundMinor, maxRemainingRefundMinor);
+    if (totalRefundMinor < rawTotalRefundMinor && rawTotalRefundMinor > 0 && returnItemsPrep.length > 0) {
+      let runningScaled = 0;
+      returnItemsPrep.forEach((item, idx) => {
+        const isLast = idx === returnItemsPrep.length - 1;
+        const scaled = isLast
+          ? totalRefundMinor - runningScaled
+          : Math.round((item.refundMinor * totalRefundMinor) / rawTotalRefundMinor);
+        item.refundMinor = scaled;
+        runningScaled += scaled;
       });
     }
 

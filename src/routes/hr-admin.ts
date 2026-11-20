@@ -16,6 +16,7 @@ import {
   clockOutStaff,
   createComplianceLicense,
   createLabOrder,
+  formatSlipsBankPayrollCsv,
   generateMonthlyPayroll,
   getHrAdminOverview,
   recordColdChainTemp,
@@ -37,6 +38,26 @@ hrAdminRouter.get('/overview', requireAuth, async (req: AuthRequest, res) => {
     const context = await requireActiveWorkspace(req.authUser!, req.header('x-tenant-id') || undefined);
     const overview = await getHrAdminOverview(context);
     return res.json({ overview, correlationId });
+  } catch (err) {
+    return sendApiError(res, err, correlationId);
+  }
+});
+
+hrAdminRouter.get('/payroll/slips.csv', requireAuth, async (req: AuthRequest, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  const correlationId = req.correlationId!;
+  try {
+    const context = await requireActiveWorkspace(req.authUser!, req.header('x-tenant-id') || undefined);
+    const month = typeof req.query.month === 'string' ? req.query.month : undefined;
+    const overview = await getHrAdminOverview(context);
+    const csv = formatSlipsBankPayrollCsv(overview, month);
+    const targetMonth = month || overview.payrollRuns[0]?.payrollMonth || overview.currentMonth;
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="suwaseva-slips-payroll-${targetMonth}.csv"`
+    );
+    return res.send(csv);
   } catch (err) {
     return sendApiError(res, err, correlationId);
   }

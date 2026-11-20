@@ -1,10 +1,12 @@
 import crypto from 'node:crypto';
-import { and, desc, eq } from 'drizzle-orm';
+import { and, desc, eq, isNull, like } from 'drizzle-orm';
 import { db, isDatabaseConfigured } from '../db/index.ts';
 import {
+  appointments,
   auditEvents,
   coldChainLogs,
   complianceLicenses,
+  doctorCommissionRules,
   hrAttendanceLogs,
   hrLeaveRequests,
   hrPayrollRuns,
@@ -22,7 +24,6 @@ import type {
   RequestLeaveInput,
   UpsertHrProfileInput,
 } from '../contracts/departments.ts';
-import { getDoctorPayoutReport } from './clinic-ops.ts';
 import { ConflictError, NotFoundError } from './errors.ts';
 import { addMemAuditEvent, getMemoryStore } from './memory-store.ts';
 import { assertWorkspaceNotReadOnlyGrace } from './subscription-billing.ts';
@@ -38,6 +39,34 @@ function diffDays(fromDate: string, toDate: string): number {
   const a = new Date(`${fromDate}T00:00:00Z`).getTime();
   const b = new Date(`${toDate}T00:00:00Z`).getTime();
   return Math.round((b - a) / 86_400_000);
+}
+
+function getMonthDateRange(payrollMonth: string): { monthStart: string; monthEnd: string } {
+  const [yStr, mStr] = payrollMonth.split('-');
+  const y = Number(yStr);
+  const m = Number(mStr);
+  const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  return {
+    monthStart: `${payrollMonth}-01`,
+    monthEnd: `${payrollMonth}-${String(lastDay).padStart(2, '0')}`,
+  };
+}
+
+function countOverlappingMonthDays(
+  startDate: string,
+  endDate: string,
+  payrollMonth: string,
+  declaredDaysCount: number
+): number {
+  const { monthStart, monthEnd } = getMonthDateRange(payrollMonth);
+  const effEnd = endDate >= startDate ? endDate : startDate;
+  if (effEnd < monthStart || startDate > monthEnd) return 0;
+  if (startDate >= monthStart && effEnd <= monthEnd) {
+    return declaredDaysCount;
+  }
+  const clampedStart = startDate > monthStart ? startDate : monthStart;
+  const clampedEnd = effEnd < monthEnd ? effEnd : monthEnd;
+  return Math.max(0, diffDays(clampedStart, clampedEnd) + 1);
 }
 
 export async function getHrAdminOverview(
@@ -362,6 +391,16 @@ export async function upsertHrProfile(
       existing.bankName = input.bankName;
       existing.bankAccountNo = input.bankAccountNo;
       existing.updatedAt = new Date();
+      addMemAuditEvent({
+        tenantId: context.tenantId,
+        actorUserId: context.userId,
+        actorUid: context.uid,
+        action: 'hr.profile_updated',
+        entityType: 'hr_profile',
+        entityId: existing.id,
+        correlationId,
+        metadataJson: { targetUserId: input.userId, basicSalaryMinor },
+      });
       return { profile: existing };
     }
     const created = {
@@ -412,6 +451,17 @@ export async function upsertHrProfile(
       })
       .where(eq(hrStaffProfiles.id, existing.id))
       .returning();
+    await db.insert(auditEvents).values({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'hr.profile_updated',
+      entityType: 'hr_profile',
+      entityId: updated.id,
+      inputSource: 'ui',
+      correlationId,
+      metadataJson: { targetUserId: input.userId, basicSalaryMinor },
+    });
     return { profile: updated };
   }
 
@@ -429,6 +479,17 @@ export async function upsertHrProfile(
       bankAccountNo: input.bankAccountNo,
     })
     .returning();
+  await db.insert(auditEvents).values({
+    tenantId: context.tenantId,
+    actorUserId: context.userId,
+    actorUid: context.uid,
+    action: 'hr.profile_updated',
+    entityType: 'hr_profile',
+    entityId: created.id,
+    inputSource: 'ui',
+    correlationId,
+    metadataJson: { targetUserId: input.userId, basicSalaryMinor },
+  });
   return { profile: created };
 }
 
@@ -488,6 +549,22 @@ export async function clockInStaff(
     return { log };
   }
 
+  const [existingOpen] = await db
+    .select({ id: hrAttendanceLogs.id })
+    .from(hrAttendanceLogs)
+    .where(
+      and(
+        eq(hrAttendanceLogs.tenantId, context.tenantId),
+        eq(hrAttendanceLogs.userId, context.userId),
+        eq(hrAttendanceLogs.businessDate, businessDate),
+        isNull(hrAttendanceLogs.clockOutAt)
+      )
+    )
+    .limit(1);
+  if (existingOpen) {
+    throw new ConflictError('You are already clocked in for today');
+  }
+
   const [created] = await db
     .insert(hrAttendanceLogs)
     .values({
@@ -502,6 +579,17 @@ export async function clockInStaff(
       notes: input.notes || '',
     })
     .returning();
+  await db.insert(auditEvents).values({
+    tenantId: context.tenantId,
+    actorUserId: context.userId,
+    actorUid: context.uid,
+    action: 'hr.clock_in',
+    entityType: 'attendance_log',
+    entityId: created.id,
+    inputSource: 'ui',
+    correlationId,
+    metadataJson: { lateMinutes, businessDate },
+  });
   return { log: created };
 }
 
@@ -574,6 +662,17 @@ export async function clockOutStaff(
     })
     .where(eq(hrAttendanceLogs.id, open.id))
     .returning();
+  await db.insert(auditEvents).values({
+    tenantId: context.tenantId,
+    actorUserId: context.userId,
+    actorUid: context.uid,
+    action: 'hr.clock_out',
+    entityType: 'attendance_log',
+    entityId: updated.id,
+    inputSource: 'ui',
+    correlationId,
+    metadataJson: { overtimeMinutes, businessDate },
+  });
   return { log: updated };
 }
 
@@ -631,6 +730,17 @@ export async function requestLeave(
       status: 'pending',
     })
     .returning();
+  await db.insert(auditEvents).values({
+    tenantId: context.tenantId,
+    actorUserId: context.userId,
+    actorUid: context.uid,
+    action: 'hr.leave_requested',
+    entityType: 'leave_request',
+    entityId: created.id,
+    inputSource: 'ui',
+    correlationId,
+    metadataJson: { leaveType: input.leaveType, daysCount: input.daysCount },
+  });
   return { leave: created };
 }
 
@@ -671,6 +781,16 @@ export async function reviewLeaveRequest(
     .where(and(eq(hrLeaveRequests.id, leaveId), eq(hrLeaveRequests.tenantId, context.tenantId)))
     .returning();
   if (!updated) throw new NotFoundError('Leave request not found');
+  await db.insert(auditEvents).values({
+    tenantId: context.tenantId,
+    actorUserId: context.userId,
+    actorUid: context.uid,
+    action: `hr.leave_${decision}`,
+    entityType: 'leave_request',
+    entityId: leaveId,
+    inputSource: 'ui',
+    correlationId,
+  });
   return { leave: updated };
 }
 
@@ -684,12 +804,80 @@ export async function generateMonthlyPayroll(
   await assertWorkspaceNotReadOnlyGrace(context.tenantId, context.timezone);
 
   const overview = await getHrAdminOverview(context);
-  const businessDate = getBusinessDateInTimezone(context.timezone);
 
+  let monthAttendance: Array<{ userId: number; overtimeMinutes: number }> = [];
   let doctorCommissionPoolMinor = 0;
-  if (context.capabilities['appointments.manage']) {
-    const payout = await getDoctorPayoutReport(context, businessDate);
-    doctorCommissionPoolMinor = payout.totalDoctorShareMinor;
+
+  if (!isDatabaseConfigured) {
+    const store = getMemoryStore();
+    monthAttendance = store.hrAttendanceLogs.filter(
+      (a) => a.tenantId === context.tenantId && a.businessDate.startsWith(payrollMonth)
+    );
+
+    if (context.capabilities['appointments.manage']) {
+      const monthAppts = store.appointments.filter(
+        (a) =>
+          a.tenantId === context.tenantId &&
+          a.branchId === context.branchId &&
+          a.businessDate.startsWith(payrollMonth) &&
+          a.status !== 'cancelled' &&
+          a.status !== 'no_show'
+      );
+      const grossByDoc = new Map<string, number>();
+      for (const a of monthAppts) {
+        grossByDoc.set(a.resourceId, (grossByDoc.get(a.resourceId) ?? 0) + a.bookedPriceMinor);
+      }
+      for (const [resourceId, grossFeesMinor] of grossByDoc.entries()) {
+        const rule = store.doctorCommissionRules.find(
+          (r) => r.tenantId === context.tenantId && r.resourceId === resourceId
+        );
+        const doctorSharePercent = rule?.doctorSharePercent ?? 75;
+        doctorCommissionPoolMinor += Math.round((grossFeesMinor * doctorSharePercent) / 100);
+      }
+    }
+  } else {
+    monthAttendance = await db
+      .select({ userId: hrAttendanceLogs.userId, overtimeMinutes: hrAttendanceLogs.overtimeMinutes })
+      .from(hrAttendanceLogs)
+      .where(
+        and(
+          eq(hrAttendanceLogs.tenantId, context.tenantId),
+          like(hrAttendanceLogs.businessDate, `${payrollMonth}%`)
+        )
+      );
+
+    if (context.capabilities['appointments.manage']) {
+      const [monthAppts, rules] = await Promise.all([
+        db
+          .select({
+            resourceId: appointments.resourceId,
+            status: appointments.status,
+            bookedPriceMinor: appointments.bookedPriceMinor,
+          })
+          .from(appointments)
+          .where(
+            and(
+              eq(appointments.tenantId, context.tenantId),
+              eq(appointments.branchId, context.branchId),
+              like(appointments.businessDate, `${payrollMonth}%`)
+            )
+          ),
+        db
+          .select()
+          .from(doctorCommissionRules)
+          .where(eq(doctorCommissionRules.tenantId, context.tenantId)),
+      ]);
+      const grossByDoc = new Map<string, number>();
+      for (const a of monthAppts) {
+        if (a.status === 'cancelled' || a.status === 'no_show') continue;
+        grossByDoc.set(a.resourceId, (grossByDoc.get(a.resourceId) ?? 0) + a.bookedPriceMinor);
+      }
+      for (const [resourceId, grossFeesMinor] of grossByDoc.entries()) {
+        const rule = rules.find((r) => r.resourceId === resourceId);
+        const doctorSharePercent = rule?.doctorSharePercent ?? 75;
+        doctorCommissionPoolMinor += Math.round((grossFeesMinor * doctorSharePercent) / 100);
+      }
+    }
   }
 
   let totalGrossMinor = 0;
@@ -698,7 +886,7 @@ export async function generateMonthlyPayroll(
   let totalEtfMinor = 0;
 
   const slips = overview.profiles.map((prof, idx) => {
-    const otMins = overview.attendanceToday
+    const otMins = monthAttendance
       .filter((a) => a.userId === prof.userId)
       .reduce((s, a) => s + a.overtimeMinutes, 0);
     const overtimeMinor = Math.round((otMins / 60) * 45000); // LKR 450/hr OT
@@ -708,10 +896,12 @@ export async function generateMonthlyPayroll(
         (l) =>
           l.userId === prof.userId &&
           l.status === 'approved' &&
-          l.leaveType === 'no_pay' &&
-          l.startDate.startsWith(payrollMonth)
+          l.leaveType === 'no_pay'
       )
-      .reduce((s, l) => s + l.daysCount, 0);
+      .reduce(
+        (s, l) => s + countOverlappingMonthDays(l.startDate, l.endDate, payrollMonth, l.daysCount),
+        0
+      );
     const noPayDeductionMinor = Math.round((prof.basicSalaryMinor / 26) * noPayDays);
     const commissionMinor = idx === 0 ? doctorCommissionPoolMinor : 0;
 
@@ -807,6 +997,18 @@ export async function generateMonthlyPayroll(
       );
     }
 
+    await tx.insert(auditEvents).values({
+      tenantId: context.tenantId,
+      actorUserId: context.userId,
+      actorUid: context.uid,
+      action: 'hr.payroll_generated',
+      entityType: 'payroll_run',
+      entityId: run.id,
+      inputSource: 'ui',
+      correlationId,
+      metadataJson: { payrollMonth, totalNetMinor, totalEmployerEpfMinor, totalEtfMinor },
+    });
+
     return { run, slips };
   });
 }
@@ -868,6 +1070,17 @@ export async function createLabOrder(
       orderedByUserId: context.userId,
     })
     .returning();
+  await db.insert(auditEvents).values({
+    tenantId: context.tenantId,
+    actorUserId: context.userId,
+    actorUid: context.uid,
+    action: 'admin.lab_order_created',
+    entityType: 'lab_order',
+    entityId: created.id,
+    inputSource: 'ui',
+    correlationId,
+    metadataJson: { testName: input.testName, feeMinor },
+  });
   return { order: created };
 }
 
@@ -913,6 +1126,17 @@ export async function updateLabOrderStatus(
     .where(and(eq(labDiagnosticOrders.id, orderId), eq(labDiagnosticOrders.tenantId, context.tenantId)))
     .returning();
   if (!updated) throw new NotFoundError('Lab order not found');
+  await db.insert(auditEvents).values({
+    tenantId: context.tenantId,
+    actorUserId: context.userId,
+    actorUid: context.uid,
+    action: 'admin.lab_order_updated',
+    entityType: 'lab_order',
+    entityId: orderId,
+    inputSource: 'ui',
+    correlationId,
+    metadataJson: { status: input.status },
+  });
   return { order: updated };
 }
 
@@ -967,6 +1191,17 @@ export async function recordColdChainTemp(
       recordedByUserId: context.userId,
     })
     .returning();
+  await db.insert(auditEvents).values({
+    tenantId: context.tenantId,
+    actorUserId: context.userId,
+    actorUid: context.uid,
+    action: 'admin.cold_chain_logged',
+    entityType: 'cold_chain_log',
+    entityId: created.id,
+    inputSource: 'ui',
+    correlationId,
+    metadataJson: { temperatureC: input.temperatureC, inRange },
+  });
   return { log: created };
 }
 
@@ -1027,5 +1262,89 @@ export async function createComplianceLicense(
       notes: input.notes || '',
     })
     .returning();
+  await db.insert(auditEvents).values({
+    tenantId: context.tenantId,
+    actorUserId: context.userId,
+    actorUid: context.uid,
+    action: 'admin.compliance_license_added',
+    entityType: 'compliance_license',
+    entityId: created.id,
+    inputSource: 'ui',
+    correlationId,
+    metadataJson: { authority: input.authority, expiresOn: input.expiresOn },
+  });
   return { license: created };
+}
+
+export function formatSlipsBankPayrollCsv(
+  overview: HrAdminOverviewResponse,
+  payrollMonth?: string
+): string {
+  const run = payrollMonth
+    ? overview.payrollRuns.find((r) => r.payrollMonth === payrollMonth) ?? overview.payrollRuns[0]
+    : overview.payrollRuns[0];
+  const monthLabel = run?.payrollMonth ?? overview.currentMonth;
+  const fmt = (minor: number) => (minor / 100).toFixed(2);
+  const rows: string[][] = [
+    [
+      'Payroll Month',
+      'Employee Name',
+      'Designation',
+      'Bank Name',
+      'Bank Account No',
+      'Gross Pay (LKR)',
+      'EPF Employee 8% (LKR)',
+      'Net SLIPS Credit (LKR)',
+      'EPF Employer 12% (LKR)',
+      'ETF Employer 3% (LKR)',
+      'Payment Reference',
+    ],
+  ];
+
+  const profileMap = new Map(overview.profiles.map((p) => [p.userId, p]));
+  if (run && run.slips.length > 0) {
+    for (const slip of run.slips) {
+      const prof = profileMap.get(slip.userId);
+      const grossMinor =
+        slip.basicMinor + slip.allowancesMinor + slip.overtimeMinor + slip.commissionMinor;
+      rows.push([
+        monthLabel,
+        slip.staffName,
+        prof?.designation ?? 'Staff',
+        prof?.bankName ?? 'Commercial Bank PLC',
+        prof?.bankAccountNo || 'PENDING-ACC',
+        fmt(grossMinor),
+        fmt(slip.epfEmployee8Minor),
+        fmt(slip.netPayMinor),
+        fmt(slip.epfEmployer12Minor),
+        fmt(slip.etfEmployer3Minor),
+        `SAL-${monthLabel.replace('-', '')}-${slip.userId}`,
+      ]);
+    }
+  } else {
+    for (const prof of overview.profiles) {
+      const grossMinor = prof.basicSalaryMinor + prof.allowancesMinor;
+      const epf8 = prof.epfApplicable ? Math.round(prof.basicSalaryMinor * 0.08) : 0;
+      const epf12 = prof.epfApplicable ? Math.round(prof.basicSalaryMinor * 0.12) : 0;
+      const etf3 = prof.etfApplicable ? Math.round(prof.basicSalaryMinor * 0.03) : 0;
+      const net = Math.max(0, grossMinor - epf8);
+      rows.push([
+        monthLabel,
+        prof.displayName,
+        prof.designation,
+        prof.bankName || 'Commercial Bank PLC',
+        prof.bankAccountNo || 'PENDING-ACC',
+        fmt(grossMinor),
+        fmt(epf8),
+        fmt(net),
+        fmt(epf12),
+        fmt(etf3),
+        `SAL-${monthLabel.replace('-', '')}-${prof.userId}`,
+      ]);
+    }
+  }
+
+  return rows
+    .map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(','))
+    .join('\n');
 }
